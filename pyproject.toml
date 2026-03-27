@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jf-hw-stress"
+version = "1.5"
+description = "Jellyfin Hardware Transcode Stress Tester"
+requires-python = ">=3.9"
+dependencies = ["rich>=13.0"]
+
+[project.scripts]
+jf-hw-stress = "jf_hw_stress:main"
