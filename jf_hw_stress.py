@@ -2371,26 +2371,49 @@ def run_headless(args: argparse.Namespace):
         print(f"ERROR: Source file not found: {args.source}", file=_sys.stderr)
         _sys.exit(1)
 
-    # Tool discovery
+    # Tool discovery — mirrors discover_tools() without interactive prompts
     if args.ffmpeg_dir:
         tools = _find_tools_in(Path(args.ffmpeg_dir))
         if not tools:
             print(f"ERROR: ffmpeg/ffprobe not found in {args.ffmpeg_dir}", file=_sys.stderr)
             _sys.exit(1)
     else:
-        tools = _tools_from_path()
+        # Check Jellyfin bundle paths first (e.g. /usr/lib/jellyfin-ffmpeg)
+        tools = None
+        for hint in JELLYFIN_HINTS.get(SYSTEM, []):
+            if hint.is_dir():
+                tools = _find_tools_in(hint)
+                if tools:
+                    print(f"[headless] Found Jellyfin bundle: {hint}", file=_sys.stderr)
+                    break
         if not tools:
-            print("ERROR: ffmpeg/ffprobe not found in PATH", file=_sys.stderr)
+            tools = _tools_from_path()
+        if not tools:
+            print("ERROR: ffmpeg/ffprobe not found in PATH or Jellyfin bundle paths. "
+                  "Use --ffmpeg-dir to specify location.", file=_sys.stderr)
             _sys.exit(1)
 
     print(f"[headless] ffmpeg: {tools.ffmpeg}", file=_sys.stderr)
     print(f"[headless] ffprobe: {tools.ffprobe}", file=_sys.stderr)
 
     # Hardware detection
+    warnings: List[str] = []
     if args.force_platform:
         hw = _force_hardware_platform(tools, args.force_platform)
+        # Detect silent fallback to software encoding
+        sw_encoders = {"libx265", "libx264", "libsvtav1"}
+        if hw.h264_enc in sw_encoders or hw.hevc_enc in sw_encoders:
+            msg = (f"WARNING: --force-platform {args.force_platform} requested but "
+                   f"hardware encoder unavailable — falling back to software "
+                   f"(h264={hw.h264_enc}, hevc={hw.hevc_enc})")
+            print(f"[headless] {msg}", file=_sys.stderr)
+            warnings.append(msg)
     else:
         hw = detect_hardware(tools)
+        if hw.name == "Software":
+            msg = "WARNING: No hardware acceleration detected — using software encoding"
+            print(f"[headless] {msg}", file=_sys.stderr)
+            warnings.append(msg)
     print(f"[headless] Hardware: {hw.name} — {hw.gpu_name}", file=_sys.stderr)
 
     # Probe source
@@ -2494,7 +2517,7 @@ def run_headless(args: argparse.Namespace):
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    tick_interval = 1.0
+    tick_interval = 0.2  # Match TUI sampling density for consistent p95/min/max stats
     last_status = 0.0
 
     while not done:
@@ -2560,6 +2583,8 @@ def run_headless(args: argparse.Namespace):
         hw, tools, source, scenario, manager, escalator, io_mon,
         cfg, test_mode, use_hw_decode, hw_saturated, total_elapsed, cache_dir,
     )
+    # Add warnings field to JSON report
+    report["warnings"] = warnings
 
     if args.json:
         print(json.dumps(report, indent=2, default=str))
@@ -2594,6 +2619,14 @@ def run_headless(args: argparse.Namespace):
             print(f"[headless] Stream #{sid} ERROR: {s.error_msg}", file=_sys.stderr)
 
     manager.kill_all()
+
+    # Exit code for CI/Kubernetes Jobs — non-zero on meaningful failures
+    has_errors = any(s.error_msg for s in manager.stats.values())
+    no_stable = escalator is not None and escalator.max_stable == 0
+    if has_errors or no_stable:
+        print(f"[headless] Exiting with code 1 (stream_errors={has_errors}, "
+              f"no_stable_streams={no_stable})", file=_sys.stderr)
+        _sys.exit(1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
