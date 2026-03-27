@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   Jellyfin Hardware Transcode Stress Tester   v1.4              ║
+║   Jellyfin Hardware Transcode Stress Tester   v1.5.1            ║
 ║   Apple VideoToolbox · NVIDIA NVENC · Intel QSV · AMD AMF       ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 Stress-tests hardware transcoding the way Jellyfin actually uses it.
 
 Usage:
-    python3 jf_stress.py
+    python3 jf_hw_stress.py                             # interactive TUI
+    python3 jf_hw_stress.py --headless --source /path/to/movie.mkv  # headless
+
+Headless mode runs without interactive prompts, outputting JSON results
+to stdout. Useful for CI, Kubernetes Jobs, and automated benchmarking.
 
 Requirements:
     pip install rich
@@ -16,8 +20,10 @@ Requirements:
 
 from __future__ import annotations
 
+import argparse
 import atexit
 import datetime
+import html as html_module
 import json
 import os
 import platform
@@ -53,7 +59,7 @@ console = Console()
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION   = "1.4"
+VERSION   = "1.5.1"
 APP_TITLE = "Jellyfin Transcode Stress Tester"
 SYSTEM    = platform.system()   # "Darwin" | "Linux" | "Windows"
 
@@ -181,6 +187,11 @@ class StreamStats:
     enc_hw:      bool = True
     dec_hw:      bool = True
     scenario_id: str  = ""
+    started_at:  float = 0.0
+    ended_at:    float = 0.0
+    fps_history: List[float] = field(default_factory=list)
+    error_msg:   str  = ""
+    platform_short: str = ""   # e.g. "vt" | "nvenc" | "qsv" | "sw"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -473,14 +484,20 @@ def _gpu_linux() -> str:
     return "GPU"
 
 
-def detect_hardware(tools: ToolPaths) -> HardwarePlatform:
+def detect_all_hardware(tools: ToolPaths) -> List[HardwarePlatform]:
+    """
+    Enumerate every available hardware backend in priority order.
+    Returns all platforms that appear usable, not just the first one.
+    This is the foundation for multi-platform selection.
+    """
     hwaccels = _run_silent([tools.ffmpeg, "-hwaccels"])
     encoders = _run_silent([tools.ffmpeg, "-encoders"])
+    found: List[HardwarePlatform] = []
 
     if SYSTEM == "Darwin" and "videotoolbox" in hwaccels:
         gpu = _mac_gpu()
         av1 = _mac_av1_hw(gpu)
-        return HardwarePlatform(
+        found.append(HardwarePlatform(
             name="Apple VideoToolbox", short="vt",
             hwaccel="videotoolbox", hwaccel_output="videotoolbox_vld",
             h264_encoder="h264_videotoolbox", hevc_encoder="hevc_videotoolbox",
@@ -489,12 +506,105 @@ def detect_hardware(tools: ToolPaths) -> HardwarePlatform:
             gpu_name=gpu,
             extra_encode_flags=["-tag:v", "hvc1"],
             hw_decode_codecs=["h264", "hevc"] + (["av1"] if av1 else []),
-        )
+        ))
 
     if "cuda" in hwaccels and "h264_nvenc" in encoders:
         gpu = (_nvidia_gpu() if shutil.which("nvidia-smi")
                else _gpu_windows() if SYSTEM == "Windows"
                else _gpu_linux())
+        found.append(HardwarePlatform(
+            name="NVIDIA NVENC", short="nvenc",
+            hwaccel="cuda", hwaccel_output="cuda",
+            h264_encoder="h264_nvenc", hevc_encoder="hevc_nvenc",
+            scale_filter="scale_cuda", tonemap_filter=None,
+            gpu_name=gpu,
+            extra_encode_flags=["-rc:v", "cbr", "-preset", "p4"],
+            hw_decode_codecs=["h264", "hevc", "av1"],
+        ))
+
+    if "qsv" in hwaccels and "h264_qsv" in encoders:
+        gpu = _gpu_windows() if SYSTEM == "Windows" else _gpu_linux()
+        found.append(HardwarePlatform(
+            name="Intel QuickSync (QSV)", short="qsv",
+            hwaccel="qsv", hwaccel_output="qsv",
+            h264_encoder="h264_qsv", hevc_encoder="hevc_qsv",
+            scale_filter="scale_qsv", tonemap_filter=None,
+            gpu_name=gpu,
+            extra_encode_flags=["-preset", "medium"],
+            hw_decode_codecs=["h264", "hevc"],
+        ))
+
+    if SYSTEM == "Windows" and "amf" in hwaccels and "h264_amf" in encoders:
+        found.append(HardwarePlatform(
+            name="AMD AMF", short="amf",
+            hwaccel="d3d11va", hwaccel_output="d3d11",
+            h264_encoder="h264_amf", hevc_encoder="hevc_amf",
+            scale_filter="scale", tonemap_filter=None,
+            gpu_name=_gpu_windows(),
+            extra_encode_flags=["-quality", "speed", "-rc", "cbr"],
+            hw_decode_codecs=["h264", "hevc"],
+        ))
+
+    if SYSTEM == "Linux" and "vaapi" in hwaccels and "h264_vaapi" in encoders:
+        hevc_enc = "hevc_vaapi" if "hevc_vaapi" in encoders else "libx265"
+        found.append(HardwarePlatform(
+            name="AMD / Intel VAAPI", short="vaapi",
+            hwaccel="vaapi", hwaccel_output="vaapi",
+            h264_encoder="h264_vaapi", hevc_encoder=hevc_enc,
+            scale_filter="scale_vaapi", tonemap_filter=None,
+            gpu_name=_gpu_linux(),
+            hw_decode_codecs=["h264", "hevc"],
+        ))
+
+    if not found:
+        found.append(HardwarePlatform(
+            name="Software (libx264/libx265)", short="sw",
+            hwaccel="", hwaccel_output="",
+            h264_encoder="libx264", hevc_encoder="libx265",
+            scale_filter="scale", tonemap_filter=_SW_TM_PURE,
+            gpu_name="CPU",
+            extra_encode_flags=["-preset", "fast"],
+            hw_decode_codecs=[],
+        ))
+
+    return found
+
+
+def detect_hardware(tools: ToolPaths) -> HardwarePlatform:
+    """Legacy single-winner selection used by headless --force-platform=None path."""
+    platforms = detect_all_hardware(tools)
+    hw = platforms[0]
+    if not hw.hwaccel:
+        console.print("  [yellow]⚠  No hardware acceleration detected — software fallback.[/yellow]")
+    return hw
+
+
+def _force_hardware_platform(tools: ToolPaths, platform: str) -> HardwarePlatform:
+    """Force a specific hardware platform, bypassing auto-detection order."""
+    encoders = _run_silent([tools.ffmpeg, "-encoders"])
+
+    if platform == "vaapi":
+        hevc_enc = "hevc_vaapi" if "hevc_vaapi" in encoders else "libx265"
+        return HardwarePlatform(
+            name="AMD / Intel VAAPI", short="vaapi",
+            hwaccel="vaapi", hwaccel_output="vaapi",
+            h264_encoder="h264_vaapi", hevc_encoder=hevc_enc,
+            scale_filter="scale_vaapi", tonemap_filter=None,
+            gpu_name=_gpu_linux() if SYSTEM == "Linux" else "GPU",
+            hw_decode_codecs=["h264", "hevc"],
+        )
+    elif platform == "qsv":
+        return HardwarePlatform(
+            name="Intel QuickSync (QSV)", short="qsv",
+            hwaccel="qsv", hwaccel_output="qsv",
+            h264_encoder="h264_qsv", hevc_encoder="hevc_qsv",
+            scale_filter="scale_qsv", tonemap_filter=None,
+            gpu_name=_gpu_linux() if SYSTEM == "Linux" else "GPU",
+            extra_encode_flags=["-preset", "medium"],
+            hw_decode_codecs=["h264", "hevc"],
+        )
+    elif platform == "nvenc":
+        gpu = (_nvidia_gpu() if shutil.which("nvidia-smi") else "NVIDIA GPU")
         return HardwarePlatform(
             name="NVIDIA NVENC", short="nvenc",
             hwaccel="cuda", hwaccel_output="cuda",
@@ -504,53 +614,37 @@ def detect_hardware(tools: ToolPaths) -> HardwarePlatform:
             extra_encode_flags=["-rc:v", "cbr", "-preset", "p4"],
             hw_decode_codecs=["h264", "hevc", "av1"],
         )
-
-    if "qsv" in hwaccels and "h264_qsv" in encoders:
-        gpu = _gpu_windows() if SYSTEM == "Windows" else _gpu_linux()
-        return HardwarePlatform(
-            name="Intel QuickSync (QSV)", short="qsv",
-            hwaccel="qsv", hwaccel_output="qsv",
-            h264_encoder="h264_qsv", hevc_encoder="hevc_qsv",
-            scale_filter="scale_qsv", tonemap_filter=None,
-            gpu_name=gpu,
-            extra_encode_flags=["-preset", "medium"],
-            hw_decode_codecs=["h264", "hevc"],
-        )
-
-    if SYSTEM == "Windows" and "amf" in hwaccels and "h264_amf" in encoders:
+    elif platform == "amf":
         return HardwarePlatform(
             name="AMD AMF", short="amf",
             hwaccel="d3d11va", hwaccel_output="d3d11",
             h264_encoder="h264_amf", hevc_encoder="hevc_amf",
             scale_filter="scale", tonemap_filter=None,
-            gpu_name=_gpu_windows(),
+            gpu_name="AMD GPU",
             extra_encode_flags=["-quality", "speed", "-rc", "cbr"],
             hw_decode_codecs=["h264", "hevc"],
         )
-
-    if SYSTEM == "Linux" and "vaapi" in hwaccels and "h264_vaapi" in encoders:
-        hevc_enc = "hevc_vaapi" if "hevc_vaapi" in encoders else "libx265"
-        if hevc_enc == "libx265":
-            console.print("  [yellow]⚠  hevc_vaapi unavailable — HEVC falls back to libx265.[/yellow]")
+    elif platform == "vt":
         return HardwarePlatform(
-            name="AMD / Intel VAAPI", short="vaapi",
-            hwaccel="vaapi", hwaccel_output="vaapi",
-            h264_encoder="h264_vaapi", hevc_encoder=hevc_enc,
-            scale_filter="scale_vaapi", tonemap_filter=None,
-            gpu_name=_gpu_linux(),
+            name="Apple VideoToolbox", short="vt",
+            hwaccel="videotoolbox", hwaccel_output="videotoolbox_vld",
+            h264_encoder="h264_videotoolbox", hevc_encoder="hevc_videotoolbox",
+            scale_filter="scale_vt",
+            tonemap_filter="tonemap_videotoolbox=p=bt709:t=bt709:m=bt709:tonemap=bt2390",
+            gpu_name="Apple GPU",
+            extra_encode_flags=["-tag:v", "hvc1"],
             hw_decode_codecs=["h264", "hevc"],
         )
-
-    console.print("  [yellow]⚠  No hardware acceleration detected — software fallback.[/yellow]")
-    return HardwarePlatform(
-        name="Software (libx264/libx265)", short="sw",
-        hwaccel="", hwaccel_output="",
-        h264_encoder="libx264", hevc_encoder="libx265",
-        scale_filter="scale", tonemap_filter=_SW_TM_PURE,
-        gpu_name="CPU",
-        extra_encode_flags=["-preset", "fast"],
-        hw_decode_codecs=[],
-    )
+    else:  # sw
+        return HardwarePlatform(
+            name="Software (libx264/libx265)", short="sw",
+            hwaccel="", hwaccel_output="",
+            h264_encoder="libx264", hevc_encoder="libx265",
+            scale_filter="scale", tonemap_filter=_SW_TM_PURE,
+            gpu_name="CPU",
+            extra_encode_flags=["-preset", "fast"],
+            hw_decode_codecs=[],
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1013,6 +1107,19 @@ def parse_log(log_path: str) -> Dict[str, str]:
     return data
 
 
+def _tail_log_error(log_path: str, lines: int = 10) -> str:
+    """Read the last N lines of an ffmpeg log to surface error messages."""
+    try:
+        with open(log_path, "r", errors="replace") as fh:
+            all_lines = fh.readlines()
+        tail = all_lines[-lines:] if len(all_lines) >= lines else all_lines
+        # Filter to lines that look like errors (not progress key=value)
+        err_lines = [ln.strip() for ln in tail if "=" not in ln or "Error" in ln or "error" in ln.lower()]
+        return "\n".join(err_lines[-5:]) if err_lines else "\n".join(ln.strip() for ln in tail[-3:])
+    except Exception:
+        return ""
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # I/O MONITOR  (write throughput to cache dir; estimated read rate)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1095,13 +1202,14 @@ class IOMonitor:
 class StreamManager:
     def __init__(
         self,
-        tools:     ToolPaths,
-        hw:        HardwarePlatform,
-        scenario:  Scenario,
-        source:    SourceInfo,
-        cache_dir: str,
-        cfg:       TestConfig,
+        tools:      ToolPaths,
+        hw:         HardwarePlatform,        # primary / first platform
+        scenario:   Scenario,
+        source:     SourceInfo,
+        cache_dir:  str,
+        cfg:        TestConfig,
         mixed_pool: Optional[List[Scenario]] = None,
+        hw_list:    Optional[List[HardwarePlatform]] = None,  # multi-platform pool
     ):
         self.tools      = tools
         self.hw         = hw
@@ -1109,7 +1217,9 @@ class StreamManager:
         self.source     = source
         self.cache_dir  = cache_dir
         self.cfg        = cfg
-        self.mixed_pool = mixed_pool   # if set, pick random scenario per launch
+        self.mixed_pool = mixed_pool
+        # If multiple platforms selected, cycle through them round-robin
+        self._hw_pool: List[HardwarePlatform] = hw_list if hw_list else [hw]
 
         self._procs:     Dict[int, subprocess.Popen] = {}
         self._log_paths: Dict[int, str]              = {}
@@ -1131,16 +1241,22 @@ class StreamManager:
                or (random.choice(self.mixed_pool) if self.mixed_pool else None)
                or self.scenario)
 
+        # Round-robin platform assignment across hw_pool
+        platform_idx = (sid - 1) % len(self._hw_pool)
+        hw_for_stream = self._hw_pool[platform_idx]
+
         cmd, log_path, enc_hw, dec_hw = build_command(
-            self.tools, self.hw, scn, self.source,
+            self.tools, hw_for_stream, scn, self.source,
             sid, self.cache_dir, self.cfg,
             use_hw_decode, use_hw_encode,
         )
         fh   = open(log_path, "w")
         proc = subprocess.Popen(cmd, stdout=fh, stderr=fh)
 
-        enc_tag  = "HW" if enc_hw else "SW"
-        label    = f"{scn.target_codec.upper()}-{scn.width}p [{enc_tag}]"
+        enc_tag = "HW" if enc_hw else "SW"
+        # Show platform short name when multiple backends in use
+        plat_tag = f"/{hw_for_stream.short.upper()}" if len(self._hw_pool) > 1 else ""
+        label    = f"{scn.target_codec.upper()}-{scn.width}p [{enc_tag}{plat_tag}]"
 
         with self._lock:
             self._procs[sid]     = proc
@@ -1149,6 +1265,8 @@ class StreamManager:
             self.stats[sid]      = StreamStats(
                 stream_id=sid, label=label, pid=proc.pid,
                 enc_hw=enc_hw, dec_hw=dec_hw, scenario_id=scn.id,
+                started_at=time.time(),
+                platform_short=hw_for_stream.short,
             )
         return sid
 
@@ -1158,7 +1276,14 @@ class StreamManager:
                 s   = self.stats[sid]
                 ret = proc.poll()
                 if ret is not None:
-                    s.status = "error" if ret != 0 else "done"
+                    if s.status not in ("error", "done"):
+                        s.ended_at = time.time()
+                    if ret != 0:
+                        s.status = "error"
+                        if not s.error_msg:
+                            s.error_msg = _tail_log_error(self._log_paths[sid])
+                    else:
+                        s.status = "done"
                     continue
                 raw      = parse_log(self._log_paths[sid])
                 s.status = "running"
@@ -1170,6 +1295,8 @@ class StreamManager:
                     s.fps = float(raw.get("fps", "0"))
                 except ValueError:
                     s.fps = 0.0
+                if s.fps > 0 and s.frames > 10:
+                    s.fps_history.append(s.fps)
                 s.bitrate_str = raw.get("bitrate", "...")
                 try:
                     s.frames = int(raw.get("frame", "0"))
@@ -1533,6 +1660,8 @@ def generate_report(
     dec_label = ("Hardware" if use_hw_decode and source.codec in hw.hw_decode_codecs
                  else "Software")
 
+    _h = html_module.escape  # safe HTML escaping for user-provided values
+
     # ── Stream rows ──────────────────────────────────────────────────────
     stream_rows = ""
     for sid in sorted(manager.stats):
@@ -1547,9 +1676,9 @@ def generate_report(
                       'starting':'<span class="badge start">start</span>'}.get(s.status, s.status)
         stream_rows += (
             f"<tr>"
-            f"<td>#{sid}</td><td>{s.label}</td><td>{stat_badge}</td>"
+            f"<td>#{sid}</td><td>{_h(s.label)}</td><td>{stat_badge}</td>"
             f'<td class="{fps_class}">{s.fps:.1f}</td>'
-            f"<td>{s.speed:.2f}×</td><td>{s.bitrate_str}</td>"
+            f"<td>{s.speed:.2f}×</td><td>{_h(s.bitrate_str)}</td>"
             f"<td>{s.frames:,}</td><td>{enc_badge}</td><td>{dec_badge}</td>"
             f"</tr>\n"
         )
@@ -1585,7 +1714,7 @@ def generate_report(
             <div class="kv"><span>Total written to cache</span><strong>{io_mon.total_written_mb:.0f} MB</strong></div>
             <div class="kv"><span>Write rate (last tick)</span><strong>{io_mon.write_mbs:.1f} MB/s</strong></div>
             <div class="kv"><span>Est. read rate</span><strong>{io_mon.read_mbs:.1f} MB/s</strong></div>
-            <div class="kv"><span>Cache directory</span><code>{cache_dir}</code></div>
+            <div class="kv"><span>Cache directory</span><code>{_h(cache_dir)}</code></div>
           </div>
         </div>"""
 
@@ -1720,8 +1849,8 @@ def generate_report(
     <h2>Hardware</h2>
     <div class="kv-grid">
       <div class="kv"><span>Platform</span><strong>{hw.name}</strong></div>
-      <div class="kv"><span>GPU</span><strong>{hw.gpu_name}</strong></div>
-      <div class="kv"><span>ffmpeg</span><code>{tools.ffmpeg}</code></div>
+      <div class="kv"><span>GPU</span><strong>{_h(hw.gpu_name)}</strong></div>
+      <div class="kv"><span>ffmpeg</span><code>{_h(tools.ffmpeg)}</code></div>
     </div>
   </div>
 
@@ -1746,7 +1875,7 @@ def generate_report(
 <div class="section">
   <h2>Source File</h2>
   <div class="kv-grid">
-    <div class="kv"><span>Path</span><code>{source.path}</code></div>
+    <div class="kv"><span>Path</span><code>{_h(source.path)}</code></div>
     <div class="kv"><span>Resolution</span><strong>{source.width}×{source.height}</strong></div>
     <div class="kv"><span>Codec</span><strong>{source.codec.upper()}  {source.profile}</strong></div>
     <div class="kv"><span>Bit depth</span><strong>{source.bit_depth}-bit  ({source.pix_fmt})</strong></div>
@@ -2067,6 +2196,475 @@ def run_loop(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# JSON REPORT GENERATOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_json_report(
+    hw:            HardwarePlatform,
+    tools:         ToolPaths,
+    source:        SourceInfo,
+    scenario:      Scenario,
+    manager:       StreamManager,
+    escalator:     Optional[EscalatingController],
+    io_mon:        Optional[IOMonitor],
+    cfg:           TestConfig,
+    test_mode:     str,
+    use_hw_decode: bool,
+    hw_saturated:  bool,
+    total_elapsed: float,
+    cache_dir:     str,
+) -> Dict[str, Any]:
+    """Generate a machine-readable JSON report for automated consumption."""
+    streams = []
+    for sid in sorted(manager.stats):
+        s = manager.stats[sid]
+        fps_hist = s.fps_history
+        stream_data: Dict[str, Any] = {
+            "id": sid,
+            "label": s.label,
+            "scenario_id": s.scenario_id,
+            "status": s.status,
+            "fps": round(s.fps, 2),
+            "speed": round(s.speed, 3),
+            "bitrate": s.bitrate_str,
+            "frames": s.frames,
+            "encode_hw": s.enc_hw,
+            "decode_hw": s.dec_hw,
+            "started_at": s.started_at,
+            "ended_at": s.ended_at if s.ended_at else None,
+            "duration_secs": round(s.ended_at - s.started_at, 2) if s.ended_at else None,
+        }
+        if fps_hist:
+            stream_data["fps_stats"] = {
+                "min": round(min(fps_hist), 2),
+                "max": round(max(fps_hist), 2),
+                "avg": round(sum(fps_hist) / len(fps_hist), 2),
+                "p50": round(sorted(fps_hist)[len(fps_hist) // 2], 2),
+                "p95": round(sorted(fps_hist)[int(len(fps_hist) * 0.95)], 2) if len(fps_hist) >= 20 else None,
+                "samples": len(fps_hist),
+            }
+        if s.error_msg:
+            stream_data["error"] = s.error_msg
+        streams.append(stream_data)
+
+    mode_labels = {
+        MODE_FIXED: "fixed", MODE_ESCALATING: "escalating",
+        MODE_HYBRID: "hybrid", MODE_MIXED: "mixed",
+    }
+
+    report: Dict[str, Any] = {
+        "version": VERSION,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "hardware": {
+            "platform": hw.name,
+            "gpu": hw.gpu_name,
+            "ffmpeg_path": tools.ffmpeg,
+            "ffprobe_path": tools.ffprobe,
+        },
+        "source": {
+            "path": source.path,
+            "width": source.width,
+            "height": source.height,
+            "codec": source.codec,
+            "profile": source.profile,
+            "bit_depth": source.bit_depth,
+            "pix_fmt": source.pix_fmt,
+            "fps": round(source.fps, 3),
+            "bitrate_mbps": round(source.bitrate_mbps, 2),
+            "hdr_type": source.hdr_type,
+            "audio_codec": source.audio_codec,
+            "audio_channels": source.audio_channels,
+        },
+        "config": {
+            "mode": mode_labels.get(test_mode, test_mode),
+            "scenario": scenario.label,
+            "target_codec": scenario.target_codec,
+            "target_bitrate": scenario.bitrate,
+            "tonemap": scenario.tonemap,
+            "hls_segment_secs": cfg.hls_segment_secs,
+            "encode_hw": bool(hw.hwaccel),
+            "decode_hw": use_hw_decode,
+        },
+        "results": {
+            "total_elapsed_secs": round(total_elapsed, 2),
+            "total_streams": manager.count,
+            "active_streams": manager.active_count,
+            "combined_speed": round(manager.combined_speed(), 3),
+            "hw_saturated": hw_saturated,
+            "streams": streams,
+        },
+    }
+
+    if escalator:
+        report["results"]["max_stable_streams"] = escalator.max_stable
+        report["results"]["fps_threshold"] = round(escalator.threshold, 2)
+        if escalator.failure_reason:
+            report["results"]["failure_reason"] = escalator.failure_reason
+
+    if io_mon:
+        report["io"] = {
+            "total_written_mb": round(io_mon.total_written_mb, 1),
+            "last_write_mbs": round(io_mon.write_mbs, 2),
+            "last_read_mbs_est": round(io_mon.read_mbs, 2),
+            "cache_dir": cache_dir,
+        }
+
+    return report
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI ARGUMENT PARSER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="jf_hw_stress",
+        description="Jellyfin Hardware Transcode Stress Tester",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Interactive TUI (default)
+  python3 jf_hw_stress.py
+
+  # Headless escalating test with JSON output
+  python3 jf_hw_stress.py --headless --source /media/movies/movie.mkv \\
+      --mode escalating --json --duration 120
+
+  # Fixed 4-stream test for CI
+  python3 jf_hw_stress.py --headless --source /data/test.mkv \\
+      --mode fixed --streams 4 --duration 60 --json
+
+  # Kubernetes Job (auto-detect ffmpeg from PATH)
+  python3 jf_hw_stress.py --headless --source /media/movies/movie.mkv \\
+      --cache-dir /dev/shm/stress --mode escalating --json --duration 180
+""",
+    )
+    p.add_argument("--headless", action="store_true",
+                    help="Run without interactive prompts (requires --source)")
+    p.add_argument("--source", type=str, metavar="PATH",
+                    help="Path to source video file")
+    p.add_argument("--ffmpeg-dir", type=str, metavar="DIR",
+                    help="Directory containing ffmpeg and ffprobe (default: system PATH)")
+    p.add_argument("--cache-dir", type=str, metavar="DIR",
+                    help="Scratch directory for HLS segments (default: /dev/shm/transcode_stress or /tmp)")
+    p.add_argument("--mode", type=str, default="escalating",
+                    choices=["fixed", "escalating", "hybrid", "mixed"],
+                    help="Test mode (default: escalating)")
+    p.add_argument("--streams", type=int, default=4,
+                    help="Number of streams for fixed mode (default: 4)")
+    p.add_argument("--scenario", type=str, default="1080p_compat",
+                    help="Scenario ID (default: 1080p_compat). Use --list-scenarios to see options")
+    p.add_argument("--hw-decode", action="store_true", default=True,
+                    help="Enable hardware decode (default: True)")
+    p.add_argument("--no-hw-decode", action="store_true",
+                    help="Disable hardware decode")
+    p.add_argument("--duration", type=int, default=300, metavar="SECS",
+                    help="Max test duration in seconds (default: 300)")
+    p.add_argument("--ramp-interval", type=float, default=12.0,
+                    help="Seconds of stability before adding a stream (default: 12)")
+    p.add_argument("--fail-secs", type=float, default=5.0,
+                    help="Seconds below threshold before failure (default: 5)")
+    p.add_argument("--fps-ratio", type=float, default=0.90,
+                    help="Min FPS ratio to maintain 0.5-1.0 (default: 0.90)")
+    p.add_argument("--json", action="store_true",
+                    help="Output JSON report to stdout")
+    p.add_argument("--json-file", type=str, metavar="PATH",
+                    help="Write JSON report to file")
+    p.add_argument("--html-report", type=str, metavar="PATH",
+                    help="Write HTML report to file")
+    p.add_argument("--force-platform", type=str, metavar="PLATFORM",
+                    choices=["vaapi", "qsv", "nvenc", "amf", "vt", "sw"],
+                    help="Force a specific hardware platform instead of auto-detect "
+                         "(useful when ffmpeg is compiled with multiple hwaccels)")
+    p.add_argument("--list-scenarios", action="store_true",
+                    help="List available scenarios and exit")
+    return p.parse_args()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HEADLESS RUNNER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_headless(args: argparse.Namespace):
+    """Non-interactive runner for CI, Kubernetes Jobs, and scripted benchmarks."""
+    import sys as _sys
+
+    # Validate required args
+    if not args.source:
+        print("ERROR: --headless requires --source", file=_sys.stderr)
+        _sys.exit(1)
+    if not Path(args.source).is_file():
+        print(f"ERROR: Source file not found: {args.source}", file=_sys.stderr)
+        _sys.exit(1)
+
+    # Tool discovery — mirrors discover_tools() without interactive prompts
+    if args.ffmpeg_dir:
+        tools = _find_tools_in(Path(args.ffmpeg_dir))
+        if not tools:
+            print(f"ERROR: ffmpeg/ffprobe not found in {args.ffmpeg_dir}", file=_sys.stderr)
+            _sys.exit(1)
+    else:
+        # Check Jellyfin bundle paths first (e.g. /usr/lib/jellyfin-ffmpeg)
+        tools = None
+        for hint in JELLYFIN_HINTS.get(SYSTEM, []):
+            if hint.is_dir():
+                tools = _find_tools_in(hint)
+                if tools:
+                    print(f"[headless] Found Jellyfin bundle: {hint}", file=_sys.stderr)
+                    break
+        if not tools:
+            tools = _tools_from_path()
+        if not tools:
+            print("ERROR: ffmpeg/ffprobe not found in PATH or Jellyfin bundle paths. "
+                  "Use --ffmpeg-dir to specify location.", file=_sys.stderr)
+            _sys.exit(1)
+
+    print(f"[headless] ffmpeg: {tools.ffmpeg}", file=_sys.stderr)
+    print(f"[headless] ffprobe: {tools.ffprobe}", file=_sys.stderr)
+
+    # Hardware detection
+    warnings: List[str] = []
+    if args.force_platform:
+        hw = _force_hardware_platform(tools, args.force_platform)
+        # Detect silent fallback to software encoding (correct field names: h264_encoder / hevc_encoder)
+        sw_encoders = {"libx265", "libx264", "libsvtav1"}
+        if hw.h264_encoder in sw_encoders or hw.hevc_encoder in sw_encoders:
+            msg = (f"WARNING: --force-platform {args.force_platform} requested but "
+                   f"hardware encoder unavailable — falling back to software "
+                   f"(h264={hw.h264_encoder}, hevc={hw.hevc_encoder})")
+            print(f"[headless] {msg}", file=_sys.stderr)
+            warnings.append(msg)
+    else:
+        # Enumerate all platforms and warn if multiple found (user should --force-platform)
+        all_platforms = detect_all_hardware(tools)
+        if len(all_platforms) > 1:
+            names = ", ".join(p.short for p in all_platforms)
+            msg = (f"WARNING: Multiple hardware backends detected ({names}). "
+                   f"Auto-selecting '{all_platforms[0].short}'. "
+                   f"Use --force-platform to choose: {names}")
+            print(f"[headless] {msg}", file=_sys.stderr)
+            warnings.append(msg)
+        hw = all_platforms[0]
+        if not hw.hwaccel:   # software fallback: hwaccel is empty string
+            msg = "WARNING: No hardware acceleration detected — using software encoding"
+            print(f"[headless] {msg}", file=_sys.stderr)
+            warnings.append(msg)
+    print(f"[headless] Hardware: {hw.name} — {hw.gpu_name}", file=_sys.stderr)
+
+    # Probe source
+    source = probe_source(tools, args.source)
+    print(f"[headless] Source: {source.width}x{source.height} {source.codec.upper()} "
+          f"{source.fps:.3f}fps {source.bitrate_mbps:.1f}Mbps {source.hdr_type}",
+          file=_sys.stderr)
+
+    # Source duration check
+    try:
+        r = subprocess.run(
+            [tools.ffprobe, "-v", "quiet", "-print_format", "json",
+             "-show_format", args.source],
+            capture_output=True, text=True, errors="replace",
+        )
+        fmt = json.loads(r.stdout).get("format", {})
+        dur = float(fmt.get("duration", 0))
+        if 0 < dur < 30:
+            print(f"WARNING: Source file is only {dur:.0f}s long — "
+                  "streams may end before test completes", file=_sys.stderr)
+    except Exception:
+        pass
+
+    # Cache directory
+    cache_dir = args.cache_dir
+    if not cache_dir:
+        shm = Path("/dev/shm")
+        cache_dir = str(shm / "transcode_stress") if shm.is_dir() else str(
+            Path(tempfile.gettempdir()) / "transcode_stress")
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    for old in Path(cache_dir).glob("st_*"):
+        try:
+            old.unlink()
+        except Exception:
+            pass
+    print(f"[headless] Cache: {cache_dir}", file=_sys.stderr)
+
+    # Map mode
+    mode_map = {
+        "fixed": MODE_FIXED, "escalating": MODE_ESCALATING,
+        "hybrid": MODE_HYBRID, "mixed": MODE_MIXED,
+    }
+    test_mode = mode_map[args.mode]
+
+    # Scenario
+    scenario_map = {s.id: s for s in SCENARIOS + MIXED_SCENARIOS}
+    if args.scenario in scenario_map:
+        scenario = scenario_map[args.scenario]
+    else:
+        scenario = SCENARIOS[3]  # 1080p_compat default
+        print(f"[headless] Scenario '{args.scenario}' not found, using {scenario.label}",
+              file=_sys.stderr)
+
+    use_hw_decode = args.hw_decode and not args.no_hw_decode
+
+    # Config
+    cfg = TestConfig(
+        ramp_interval=args.ramp_interval,
+        fail_secs=args.fail_secs,
+        fps_ratio=args.fps_ratio,
+    )
+
+    # Mixed pool
+    mixed_pool: Optional[List[Scenario]] = None
+    if test_mode == MODE_MIXED:
+        mixed_pool = list(MIXED_SCENARIOS)
+        if source.is_hdr:
+            mixed_pool += MIXED_HDR_SCENARIOS
+
+    # Build objects
+    manager = StreamManager(tools, hw, scenario, source, cache_dir, cfg, mixed_pool)
+    io_mon = IOMonitor(cache_dir, source)
+    escalator: Optional[EscalatingController] = None
+    if test_mode != MODE_FIXED:
+        escalator = EscalatingController(cfg, source.fps)
+
+    events: List[str] = []
+    start_time = time.time()
+    hw_saturated = False
+
+    def ts() -> str:
+        return _fmt_elapsed(time.time() - start_time)
+
+    # Initial launches
+    if test_mode == MODE_FIXED:
+        for _ in range(args.streams):
+            manager.launch(use_hw_decode=use_hw_decode, use_hw_encode=True)
+        print(f"[headless] Launched {args.streams} fixed streams", file=_sys.stderr)
+    else:
+        manager.launch(use_hw_decode=use_hw_decode, use_hw_encode=True)
+        thr = source.fps * cfg.fps_ratio
+        print(f"[headless] Stream #1 launched — threshold {thr:.1f} fps", file=_sys.stderr)
+
+    io_mon.start()
+
+    # Headless main loop — no TUI, just poll and escalate
+    done = False
+    def shutdown(sig=None, frame=None):
+        nonlocal done
+        done = True
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    tick_interval = 0.2  # Match TUI sampling density for consistent p95/min/max stats
+    last_status = 0.0
+
+    while not done:
+        time.sleep(tick_interval)
+        manager.refresh()
+        elapsed = time.time() - start_time
+
+        # Duration limit
+        if elapsed >= args.duration:
+            print(f"[headless] Duration limit ({args.duration}s) reached", file=_sys.stderr)
+            done = True
+            break
+
+        # Escalation logic
+        if escalator and test_mode in (MODE_ESCALATING, MODE_HYBRID, MODE_MIXED):
+            action = escalator.tick(manager.stats)
+            if action == "add":
+                use_enc = not hw_saturated
+                use_dec = use_hw_decode and not hw_saturated
+                sid = manager.launch(use_hw_decode=use_dec, use_hw_encode=use_enc)
+                enc_tag = "HW" if use_enc else "SW"
+                msg = f"{ts()}  ↑ Stream #{sid} [{enc_tag}] ({manager.count} total)"
+                events.append(msg)
+                print(f"[headless] {msg}", file=_sys.stderr)
+            elif action == "fail":
+                if test_mode == MODE_HYBRID and not hw_saturated:
+                    hw_saturated = True
+                    msg = f"{ts()}  HW saturated at {manager.count} streams — pivoting to SW"
+                    events.append(msg)
+                    print(f"[headless] {msg}", file=_sys.stderr)
+                    escalator.reset_warmup()
+                    sid = manager.launch(use_hw_decode=False, use_hw_encode=False)
+                    events.append(f"{ts()}  ↑ Stream #{sid} [SW]")
+                else:
+                    msg = f"{ts()}  Max stable: {escalator.max_stable} stream(s)"
+                    events.append(msg)
+                    if escalator.failure_reason:
+                        events.append(escalator.failure_reason)
+                    print(f"[headless] SATURATION: {msg}", file=_sys.stderr)
+                    done = True
+
+        # Periodic status
+        if elapsed - last_status >= 10:
+            running = [s for s in manager.stats.values() if s.status == "running"]
+            if running:
+                avg_fps = sum(s.fps for s in running) / len(running)
+                combined = manager.combined_speed()
+                print(f"[headless] {ts()} | {len(running)} streams | "
+                      f"avg FPS {avg_fps:.1f} | speed {combined:.2f}x",
+                      file=_sys.stderr)
+            last_status = elapsed
+
+        # Check for all streams dead
+        if all(s.status in ("error", "done") for s in manager.stats.values()):
+            print("[headless] All streams ended", file=_sys.stderr)
+            done = True
+
+    io_mon.stop()
+    total_elapsed = time.time() - start_time
+
+    # Generate reports
+    report = generate_json_report(
+        hw, tools, source, scenario, manager, escalator, io_mon,
+        cfg, test_mode, use_hw_decode, hw_saturated, total_elapsed, cache_dir,
+    )
+    # Add warnings field to JSON report
+    report["warnings"] = warnings
+
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+
+    if args.json_file:
+        Path(args.json_file).write_text(json.dumps(report, indent=2, default=str))
+        print(f"[headless] JSON report saved: {args.json_file}", file=_sys.stderr)
+
+    if args.html_report:
+        rpath = generate_report(
+            hw, tools, source, scenario, manager, escalator, io_mon,
+            cfg, test_mode, use_hw_decode, hw_saturated, total_elapsed, cache_dir,
+        )
+        # Move to requested path
+        import shutil as _shutil
+        _shutil.move(rpath, args.html_report)
+        print(f"[headless] HTML report saved: {args.html_report}", file=_sys.stderr)
+
+    # Print summary to stderr
+    print(f"\n[headless] === RESULTS ===", file=_sys.stderr)
+    print(f"[headless] Hardware: {hw.name} — {hw.gpu_name}", file=_sys.stderr)
+    print(f"[headless] Mode: {args.mode}", file=_sys.stderr)
+    print(f"[headless] Streams: {manager.count} total, {manager.active_count} active", file=_sys.stderr)
+    print(f"[headless] Combined speed: {manager.combined_speed():.2f}x", file=_sys.stderr)
+    if escalator:
+        print(f"[headless] Max stable: {escalator.max_stable}", file=_sys.stderr)
+    print(f"[headless] Elapsed: {_fmt_elapsed(total_elapsed)}", file=_sys.stderr)
+
+    # Surface errors
+    for sid, s in manager.stats.items():
+        if s.error_msg:
+            print(f"[headless] Stream #{sid} ERROR: {s.error_msg}", file=_sys.stderr)
+
+    manager.kill_all()
+
+    # Exit code for CI/Kubernetes Jobs — non-zero on meaningful failures
+    has_errors = any(s.error_msg for s in manager.stats.values())
+    no_stable = escalator is not None and escalator.max_stable == 0
+    if has_errors or no_stable:
+        print(f"[headless] Exiting with code 1 (stream_errors={has_errors}, "
+              f"no_stable_streams={no_stable})", file=_sys.stderr)
+        _sys.exit(1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2087,9 +2685,56 @@ def main():
 
         # ── Hardware detection ─────────────────────────────────────────────
         console.print()
-        console.print("[dim]  Detecting hardware acceleration …[/dim]", end="  ")
-        hw = detect_hardware(tools)
-        console.print(f"[green]✓[/green]  [bold cyan]{esc(hw.name)}[/bold cyan]  {esc(hw.gpu_name)}")
+        console.print("[dim]  Detecting hardware acceleration …[/dim]")
+        all_platforms = detect_all_hardware(tools)
+
+        if len(all_platforms) == 1:
+            # Only one option — use it directly
+            hw = all_platforms[0]
+            hw_list = [hw]
+            if not hw.hwaccel:
+                console.print("  [yellow]⚠  No hardware acceleration — software fallback.[/yellow]")
+            else:
+                console.print(
+                    f"  [green]✓[/green]  [bold cyan]{esc(hw.name)}[/bold cyan]  {esc(hw.gpu_name)}"
+                )
+        else:
+            # Multiple backends — let the user pick one or more
+            console.print()
+            console.print(f"  [bold]Detected {len(all_platforms)} hardware backends:[/bold]\n")
+            for idx, p in enumerate(all_platforms, 1):
+                console.print(
+                    f"    [bold]{idx}[/bold]  [cyan]{esc(p.name)}[/cyan]  [dim]{esc(p.gpu_name)}[/dim]"
+                )
+            console.print()
+            console.print(
+                "  Enter one number to use a single backend, or multiple numbers\n"
+                "  separated by commas to interleave backends across streams\n"
+                "  (e.g. [bold]1,2[/bold] to alternate NVENC and QSV per stream).\n"
+            )
+            valid_idxs = {str(i) for i in range(1, len(all_platforms) + 1)}
+            while True:
+                raw = Prompt.ask("  Backend(s)", default="1").strip()
+                parts = [x.strip() for x in raw.split(",") if x.strip()]
+                if all(p in valid_idxs for p in parts) and parts:
+                    selected_idxs = [int(p) - 1 for p in parts]
+                    hw_list = [all_platforms[i] for i in selected_idxs]
+                    hw = hw_list[0]
+                    break
+                console.print(
+                    f"  [red]✗  Enter numbers between 1 and {len(all_platforms)}, "
+                    "comma-separated.[/red]"
+                )
+            if len(hw_list) == 1:
+                console.print(
+                    f"  [green]✓[/green]  [bold cyan]{esc(hw.name)}[/bold cyan]  {esc(hw.gpu_name)}"
+                )
+            else:
+                names = " + ".join(esc(p.name) for p in hw_list)
+                console.print(f"  [green]✓[/green]  Multi-platform: [bold cyan]{names}[/bold cyan]")
+                console.print(
+                    "  [dim]Streams will be assigned round-robin across selected backends.[/dim]"
+                )
 
         # ── Source file ────────────────────────────────────────────────────
         input_path = pick_source_file()
@@ -2122,7 +2767,8 @@ def main():
                 pass
 
         # ── Build objects ──────────────────────────────────────────────────
-        manager = StreamManager(tools, hw, scenario, source, cache_dir, cfg, mixed_pool)
+        manager = StreamManager(tools, hw, scenario, source, cache_dir, cfg, mixed_pool,
+                                hw_list=hw_list)
         io_mon  = IOMonitor(cache_dir, source)
 
         if test_mode != MODE_FIXED:
@@ -2290,4 +2936,20 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+
+    if args.list_scenarios:
+        print("Available scenarios:")
+        print(f"  {'ID':<20} {'Label':<26} {'Bitrate':<8} {'TM'}")
+        print(f"  {'─'*20} {'─'*26} {'─'*8} {'─'*4}")
+        for s in SCENARIOS:
+            print(f"  {s.id:<20} {s.label:<26} {s.bitrate:<8} {'✓' if s.tonemap else '–'}")
+        print("\nMixed-bag pool:")
+        for s in MIXED_SCENARIOS:
+            print(f"  {s.id:<20} {s.label:<26} {s.bitrate:<8} {'✓' if s.tonemap else '–'}")
+        sys.exit(0)
+
+    if args.headless:
+        run_headless(args)
+    else:
+        main()
