@@ -13,6 +13,11 @@ Usage:
 
 Headless mode runs without interactive prompts, outputting JSON results
 to stdout. Useful for CI, Kubernetes Jobs, and automated benchmarking.
+    python3 jf_hw_stress.py                             # interactive TUI
+    python3 jf_hw_stress.py --headless --source /path/to/movie.mkv  # headless
+
+Headless mode runs without interactive prompts, outputting JSON results
+to stdout. Useful for CI, Kubernetes Jobs, and automated benchmarking.
 
 Requirements:
     pip install rich
@@ -21,8 +26,10 @@ Requirements:
 from __future__ import annotations
 
 import argparse
+import argparse
 import atexit
 import datetime
+import html as html_module
 import html as html_module
 import json
 import os
@@ -1120,6 +1127,19 @@ def _tail_log_error(log_path: str, lines: int = 10) -> str:
         return ""
 
 
+def _tail_log_error(log_path: str, lines: int = 10) -> str:
+    """Read the last N lines of an ffmpeg log to surface error messages."""
+    try:
+        with open(log_path, "r", errors="replace") as fh:
+            all_lines = fh.readlines()
+        tail = all_lines[-lines:] if len(all_lines) >= lines else all_lines
+        # Filter to lines that look like errors (not progress key=value)
+        err_lines = [ln.strip() for ln in tail if "=" not in ln or "Error" in ln or "error" in ln.lower()]
+        return "\n".join(err_lines[-5:]) if err_lines else "\n".join(ln.strip() for ln in tail[-3:])
+    except Exception:
+        return ""
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # I/O MONITOR  (write throughput to cache dir; estimated read rate)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1284,6 +1304,14 @@ class StreamManager:
                             s.error_msg = _tail_log_error(self._log_paths[sid])
                     else:
                         s.status = "done"
+                    if s.status not in ("error", "done"):
+                        s.ended_at = time.time()
+                    if ret != 0:
+                        s.status = "error"
+                        if not s.error_msg:
+                            s.error_msg = _tail_log_error(self._log_paths[sid])
+                    else:
+                        s.status = "done"
                     continue
                 raw      = parse_log(self._log_paths[sid])
                 s.status = "running"
@@ -1295,6 +1323,8 @@ class StreamManager:
                     s.fps = float(raw.get("fps", "0"))
                 except ValueError:
                     s.fps = 0.0
+                if s.fps > 0 and s.frames > 10:
+                    s.fps_history.append(s.fps)
                 if s.fps > 0 and s.frames > 10:
                     s.fps_history.append(s.fps)
                 s.bitrate_str = raw.get("bitrate", "...")
@@ -1662,6 +1692,8 @@ def generate_report(
 
     _h = html_module.escape  # safe HTML escaping for user-provided values
 
+    _h = html_module.escape  # safe HTML escaping for user-provided values
+
     # ── Stream rows ──────────────────────────────────────────────────────
     stream_rows = ""
     for sid in sorted(manager.stats):
@@ -1677,7 +1709,9 @@ def generate_report(
         stream_rows += (
             f"<tr>"
             f"<td>#{sid}</td><td>{_h(s.label)}</td><td>{stat_badge}</td>"
+            f"<td>#{sid}</td><td>{_h(s.label)}</td><td>{stat_badge}</td>"
             f'<td class="{fps_class}">{s.fps:.1f}</td>'
+            f"<td>{s.speed:.2f}×</td><td>{_h(s.bitrate_str)}</td>"
             f"<td>{s.speed:.2f}×</td><td>{_h(s.bitrate_str)}</td>"
             f"<td>{s.frames:,}</td><td>{enc_badge}</td><td>{dec_badge}</td>"
             f"</tr>\n"
@@ -1714,6 +1748,7 @@ def generate_report(
             <div class="kv"><span>Total written to cache</span><strong>{io_mon.total_written_mb:.0f} MB</strong></div>
             <div class="kv"><span>Write rate (last tick)</span><strong>{io_mon.write_mbs:.1f} MB/s</strong></div>
             <div class="kv"><span>Est. read rate</span><strong>{io_mon.read_mbs:.1f} MB/s</strong></div>
+            <div class="kv"><span>Cache directory</span><code>{_h(cache_dir)}</code></div>
             <div class="kv"><span>Cache directory</span><code>{_h(cache_dir)}</code></div>
           </div>
         </div>"""
@@ -1851,6 +1886,8 @@ def generate_report(
       <div class="kv"><span>Platform</span><strong>{hw.name}</strong></div>
       <div class="kv"><span>GPU</span><strong>{_h(hw.gpu_name)}</strong></div>
       <div class="kv"><span>ffmpeg</span><code>{_h(tools.ffmpeg)}</code></div>
+      <div class="kv"><span>GPU</span><strong>{_h(hw.gpu_name)}</strong></div>
+      <div class="kv"><span>ffmpeg</span><code>{_h(tools.ffmpeg)}</code></div>
     </div>
   </div>
 
@@ -1875,6 +1912,7 @@ def generate_report(
 <div class="section">
   <h2>Source File</h2>
   <div class="kv-grid">
+    <div class="kv"><span>Path</span><code>{_h(source.path)}</code></div>
     <div class="kv"><span>Path</span><code>{_h(source.path)}</code></div>
     <div class="kv"><span>Resolution</span><strong>{source.width}×{source.height}</strong></div>
     <div class="kv"><span>Codec</span><strong>{source.codec.upper()}  {source.profile}</strong></div>
@@ -2936,6 +2974,23 @@ def main():
 
 
 if __name__ == "__main__":
+    args = parse_args()
+
+    if args.list_scenarios:
+        print("Available scenarios:")
+        print(f"  {'ID':<20} {'Label':<26} {'Bitrate':<8} {'TM'}")
+        print(f"  {'─'*20} {'─'*26} {'─'*8} {'─'*4}")
+        for s in SCENARIOS:
+            print(f"  {s.id:<20} {s.label:<26} {s.bitrate:<8} {'✓' if s.tonemap else '–'}")
+        print("\nMixed-bag pool:")
+        for s in MIXED_SCENARIOS:
+            print(f"  {s.id:<20} {s.label:<26} {s.bitrate:<8} {'✓' if s.tonemap else '–'}")
+        sys.exit(0)
+
+    if args.headless:
+        run_headless(args)
+    else:
+        main()
     args = parse_args()
 
     if args.list_scenarios:
