@@ -563,6 +563,74 @@ def detect_hardware(tools: ToolPaths) -> HardwarePlatform:
     )
 
 
+def _force_hardware_platform(tools: ToolPaths, platform: str) -> HardwarePlatform:
+    """Force a specific hardware platform, bypassing auto-detection order."""
+    encoders = _run_silent([tools.ffmpeg, "-encoders"])
+
+    if platform == "vaapi":
+        hevc_enc = "hevc_vaapi" if "hevc_vaapi" in encoders else "libx265"
+        return HardwarePlatform(
+            name="AMD / Intel VAAPI", short="vaapi",
+            hwaccel="vaapi", hwaccel_output="vaapi",
+            h264_encoder="h264_vaapi", hevc_encoder=hevc_enc,
+            scale_filter="scale_vaapi", tonemap_filter=None,
+            gpu_name=_gpu_linux() if SYSTEM == "Linux" else "GPU",
+            hw_decode_codecs=["h264", "hevc"],
+        )
+    elif platform == "qsv":
+        return HardwarePlatform(
+            name="Intel QuickSync (QSV)", short="qsv",
+            hwaccel="qsv", hwaccel_output="qsv",
+            h264_encoder="h264_qsv", hevc_encoder="hevc_qsv",
+            scale_filter="scale_qsv", tonemap_filter=None,
+            gpu_name=_gpu_linux() if SYSTEM == "Linux" else "GPU",
+            extra_encode_flags=["-preset", "medium"],
+            hw_decode_codecs=["h264", "hevc"],
+        )
+    elif platform == "nvenc":
+        gpu = (_nvidia_gpu() if shutil.which("nvidia-smi") else "NVIDIA GPU")
+        return HardwarePlatform(
+            name="NVIDIA NVENC", short="nvenc",
+            hwaccel="cuda", hwaccel_output="cuda",
+            h264_encoder="h264_nvenc", hevc_encoder="hevc_nvenc",
+            scale_filter="scale_cuda", tonemap_filter=None,
+            gpu_name=gpu,
+            extra_encode_flags=["-rc:v", "cbr", "-preset", "p4"],
+            hw_decode_codecs=["h264", "hevc", "av1"],
+        )
+    elif platform == "amf":
+        return HardwarePlatform(
+            name="AMD AMF", short="amf",
+            hwaccel="d3d11va", hwaccel_output="d3d11",
+            h264_encoder="h264_amf", hevc_encoder="hevc_amf",
+            scale_filter="scale", tonemap_filter=None,
+            gpu_name="AMD GPU",
+            extra_encode_flags=["-quality", "speed", "-rc", "cbr"],
+            hw_decode_codecs=["h264", "hevc"],
+        )
+    elif platform == "vt":
+        return HardwarePlatform(
+            name="Apple VideoToolbox", short="vt",
+            hwaccel="videotoolbox", hwaccel_output="videotoolbox_vld",
+            h264_encoder="h264_videotoolbox", hevc_encoder="hevc_videotoolbox",
+            scale_filter="scale_vt",
+            tonemap_filter="tonemap_videotoolbox=p=bt709:t=bt709:m=bt709:tonemap=bt2390",
+            gpu_name="Apple GPU",
+            extra_encode_flags=["-tag:v", "hvc1"],
+            hw_decode_codecs=["h264", "hevc"],
+        )
+    else:  # sw
+        return HardwarePlatform(
+            name="Software (libx264/libx265)", short="sw",
+            hwaccel="", hwaccel_output="",
+            h264_encoder="libx264", hevc_encoder="libx265",
+            scale_filter="scale", tonemap_filter=_SW_TM_PURE,
+            gpu_name="CPU",
+            extra_encode_flags=["-preset", "fast"],
+            hw_decode_codecs=[],
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SOURCE FILE SELECTION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2278,6 +2346,10 @@ Examples:
                     help="Write JSON report to file")
     p.add_argument("--html-report", type=str, metavar="PATH",
                     help="Write HTML report to file")
+    p.add_argument("--force-platform", type=str, metavar="PLATFORM",
+                    choices=["vaapi", "qsv", "nvenc", "amf", "vt", "sw"],
+                    help="Force a specific hardware platform instead of auto-detect "
+                         "(useful when ffmpeg is compiled with multiple hwaccels)")
     p.add_argument("--list-scenarios", action="store_true",
                     help="List available scenarios and exit")
     return p.parse_args()
@@ -2315,7 +2387,10 @@ def run_headless(args: argparse.Namespace):
     print(f"[headless] ffprobe: {tools.ffprobe}", file=_sys.stderr)
 
     # Hardware detection
-    hw = detect_hardware(tools)
+    if args.force_platform:
+        hw = _force_hardware_platform(tools, args.force_platform)
+    else:
+        hw = detect_hardware(tools)
     print(f"[headless] Hardware: {hw.name} — {hw.gpu_name}", file=_sys.stderr)
 
     # Probe source
