@@ -120,7 +120,7 @@ file paths replaced by typical ones.
 ```json
 {
   "schema_version": 2,
-  "tool": {"name": "jf-hw-stress", "version": "2.0.0"},
+  "tool": {"name": "jf-hw-stress", "version": "2.1.0"},
   "started_at": "2026-10-31T08:38:13-06:00",
   "ended_at": "2026-10-31T08:41:48-06:00",
   "duration_secs": 214.5,
@@ -143,7 +143,7 @@ file paths replaced by typical ones.
              "duration_limit_secs": null, "max_streams": 64, "seed": null},
   "result": {"stop_reason": "limit-reached", "limit_reached": true, "max_stable_streams": 11,
              "hw_max_stable_streams": null, "streams_keeping_up": null, "peak_concurrent_streams": 12,
-             "peak_combined_fps": 308.7,
+             "peak_combined_fps": 308.7, "avg_output_mbps": 5.96,
              "failure": {"stream": 1, "reason": "stream 1 fell to 20.9 fps, under 21.6 fps for 5 s",
                          "kind": "capacity"}},
   "io": {"segments_written_mb": 1652.7, "peak_write_mb_s": 17.63,
@@ -154,7 +154,7 @@ file paths replaced by typical ones.
      "decode": {"hw": true}, "tonemap": "hardware", "status": "stopped",
      "started_at": "2026-10-31T08:38:13-06:00", "ended_at": "2026-10-31T08:41:47-06:00", "frames": 14171,
      "fps": {"samples": 205, "min": 20.83, "p5": 22.5, "p50": 42.02, "avg": 67.51, "max": 255.82},
-     "error": null}
+     "output_mbps": 5.96, "error": null}
   ],
   "timeline": [
     {"t": 0.0, "streams": 1, "combined_fps": 0, "min_fps": null, "read_mbps": 0.0},
