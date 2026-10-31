@@ -31,6 +31,7 @@ def run(cfg: RunConfig, tools: Tools, source: SourceInfo, work_base: str, keep_f
     def on_signal(signum, frame):
         interrupted["flag"] = True
     previous = {s: signal.signal(s, on_signal) for s in (signal.SIGINT, signal.SIGTERM)}
+    shown = 0   # events already printed
     try:
         engine.start()
         say(f"work directory {work_dir}")
@@ -40,6 +41,9 @@ def run(cfg: RunConfig, tools: Tools, source: SourceInfo, work_base: str, keep_f
                 engine.finish("user")
                 break
             engine.tick()
+            for event in engine.events[shown:]:
+                say(f"{event.t:6.1f} s  {event.message}")
+            shown = len(engine.events)
             if engine.state == "limit":
                 engine.finish()
                 break
@@ -61,7 +65,7 @@ def run(cfg: RunConfig, tools: Tools, source: SourceInfo, work_base: str, keep_f
             remove_work_dir(work_dir)
 
     data = reports.build(engine, warnings)
-    for event in engine.events[-6:]:
+    for event in engine.events[shown:]:
         say(f"{event.t:6.1f} s  {event.message}")
     res = data["result"]
     if res["max_stable_streams"] is not None:

@@ -14,7 +14,7 @@ from . import tools as tl
 from .command import AUDIO_MODES, CommandError, Options
 from .controller import Thresholds
 from .engine import MODES, RunConfig
-from .probe import ProbeError, probe
+from .probe import ProbeError, dovi_notes, probe
 
 EPILOG = """\
 examples:
@@ -23,7 +23,8 @@ examples:
   jf-hw-stress --headless --source movie.mkv --mode fixed --streams 6 --duration 120 --html-report r.html
   jf-hw-stress --list-platforms                         what this machine and ffmpeg build support
 
-exit codes: 0 result produced · 1 the run failed (a stream crashed, or none kept up) · 2 setup error · 130 interrupted
+exit codes: 0 result produced · 1 the run failed (a stream crashed or stalled, or none kept up) · 2 setup error
+            130 interrupted
 """
 
 
@@ -151,6 +152,11 @@ def headless(args: argparse.Namespace) -> int:
         source = probe(tools.ffprobe, str(source_path))
         hl.say(f"source: {source.width}x{source.height} {source.codec} {source.bit_depth}-bit {source.fps} fps "
                f"{source.bitrate_mbps} Mbps {source.hdr_type}, audio {source.audio_label()}")
+        notes = dovi_notes(source.dovi_profile)
+        for note in notes:
+            hl.say("note: " + note)
+        if notes and source.dovi_profile not in (7, 8):   # profile 5 or unknown: colours may be wrong
+            warnings.append(notes[0])
         if not source.fps:
             hl.say("the source frame rate is unknown, so there is no real-time threshold")
             return hl.EXIT_SETUP
@@ -185,7 +191,21 @@ def headless(args: argparse.Namespace) -> int:
         return hl.EXIT_SETUP
 
 
+def safe_console() -> None:
+    """Labels use characters like → and ×; on a console that cannot show them (Windows cp1252 when
+    redirected), print a replacement character rather than crash."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            "→×".encode(stream.encoding or "ascii")
+        except (UnicodeEncodeError, LookupError):
+            try:
+                stream.reconfigure(errors="replace")
+            except (AttributeError, ValueError):
+                pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    safe_console()
     args = parser().parse_args(argv)
     problems = validate(args)
     if problems:
