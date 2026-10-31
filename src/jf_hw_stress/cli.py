@@ -99,9 +99,9 @@ def find_tools(path: Optional[str]) -> tl.Tools:
 
 
 def list_scenarios() -> None:
-    print(f"{'id':<18} {'label':<22} {'codec':<5} {'width':>5} {'bitrate':>8}  tone map")
-    for group, items in (("Scenarios", scn.SCENARIOS), ("Mixed-mode pool", scn.MIXED)):
-        print(f"\n{group}:")
+    for n, (group, items) in enumerate((("Scenarios", scn.SCENARIOS), ("Mixed-mode pool", scn.MIXED))):
+        print(f"{chr(10) if n else ''}{group}:")
+        print(f"{'id':<18} {'label':<22} {'codec':<5} {'width':>5} {'bitrate':>8}  tone map")
         for s in items:
             print(f"{s.id:<18} {s.label:<22} {s.codec:<5} {s.width:>5} {s.bitrate:>8}  {'yes' if s.tonemap else '-'}")
 
