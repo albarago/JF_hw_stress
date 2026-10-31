@@ -21,6 +21,7 @@ from .tools import Tools
 
 MODES = ("fixed", "escalating", "hybrid", "mixed")
 MODE_LABELS = {"fixed": "Fixed", "escalating": "Escalating", "hybrid": "Hybrid HW → SW", "mixed": "Mixed"}
+STALL_RETRIES = 1     # a stream that never produces a frame is replaced this many times before the run fails
 
 
 @dataclass
@@ -106,6 +107,7 @@ class Engine:
         self._start_mono = 0.0
         self._hw_platforms = [p for p in config.platforms if p.is_hardware] or [SOFTWARE]
         self._rr = 0
+        self._stall_retries = 0
         self.controller: Optional[Controller] = None
         if config.mode != "fixed":
             self.controller = Controller(source.fps, config.thresholds, clock)
@@ -205,18 +207,31 @@ class Engine:
         elif decision.action == "fail":
             self.log(decision.reason)
             failed = self._by_id(decision.stream_id)
-            capacity = failed is not None and failed.status != "error"
-            if capacity:
-                self._shed_newest()   # back off to the last load that kept up
-            if self.cfg.mode == "hybrid" and not self.saturated:
-                self.saturated = True
-                self.hw_max_stable = self.controller.max_stable
-                self.log(f"hardware limit: {self.hw_max_stable} stream(s); adding software streams")
+            if decision.kind == "stall" and failed is not None and self._stall_retries < STALL_RETRIES:
+                # A stream that never starts says nothing about capacity (seen once on VideoToolbox
+                # with 6 streams running fine): replace it and keep going.
+                self._stall_retries += 1
+                self.controller.ignore(failed.info.id)
+                failed.stop()
+                self.warnings.append(f"stream {failed.info.id} produced no frames and was replaced")
+                self.log(f"stream {failed.info.id} stopped; starting a replacement")
                 self.controller.rearm()
-                self.launch(software=True)
+                self.launch(software=not failed.info.encode_hw)
                 return
-            self.failure = {"stream": decision.stream_id, "reason": decision.reason, "kind": "capacity" if capacity else "error"}
-            self._limit("limit-reached")
+            if decision.kind == "capacity":
+                self._shed_newest()   # back off to the last load that kept up
+                if self.cfg.mode == "hybrid" and not self.saturated:
+                    self.saturated = True
+                    self.hw_max_stable = self.controller.max_stable
+                    self.log(f"hardware limit: {self.hw_max_stable} stream(s); adding software streams")
+                    self.controller.rearm()
+                    self.launch(software=True)
+                    return
+            elif failed is not None and failed.active:
+                self.controller.ignore(failed.info.id)
+                failed.stop()
+            self.failure = {"stream": decision.stream_id, "reason": decision.reason, "kind": decision.kind}
+            self._limit("limit-reached" if decision.kind == "capacity" else "stream-failed")
 
     def _by_id(self, sid: Optional[int]) -> Optional[Stream]:
         return next((s for s in self.streams if s.info.id == sid), None)

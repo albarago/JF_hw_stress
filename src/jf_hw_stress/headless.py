@@ -85,11 +85,11 @@ def run(cfg: RunConfig, tools: Tools, source: SourceInfo, work_base: str, keep_f
 
 
 def exit_code(data: dict) -> int:
-    """0: a valid result. 1: the run itself failed (a stream crashed, or not even one stream kept up)."""
+    """0: a valid result. 1: the run itself failed (a stream crashed or stalled, or not even one kept up)."""
     res = data["result"]
     crashed = any(s["status"] == "error" for s in data["streams"])
     if res["max_stable_streams"] is not None:   # escalating modes
-        if res["max_stable_streams"] == 0 or (res.get("failure") or {}).get("kind") == "error":
+        if res["max_stable_streams"] == 0 or (res.get("failure") or {}).get("kind") in ("error", "stall"):
             return EXIT_RESULT
         return EXIT_OK
     return EXIT_RESULT if crashed else EXIT_OK

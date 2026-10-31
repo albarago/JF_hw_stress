@@ -30,6 +30,7 @@ class Decision:
     action: str            # wait | add | fail
     reason: str = ""
     stream_id: Optional[int] = None
+    kind: str = ""         # for fail: capacity (fell behind) | stall (never produced a frame) | error (ffmpeg exited)
 
 
 class Controller:
@@ -66,13 +67,13 @@ class Controller:
         for r in readings:
             if r.status == "error" and r.id not in self._seen_errors:
                 self._seen_errors.add(r.id)
-                return self._fail(f"stream {r.id} stopped with an error: {r.error or 'unknown error'}", r.id)
+                return self._fail(f"stream {r.id} stopped with an error: {r.error or 'unknown error'}", r.id, "error")
         live = [r for r in readings if r.status in ("starting", "running")]
         if not live:
             return Decision("wait")
         for r in live:
             if r.fps is None and r.age > self.t.start_timeout:
-                return self._fail(f"stream {r.id} produced no frames in {self.t.start_timeout:.0f} s", r.id)
+                return self._fail(f"stream {r.id} produced no frames in {self.t.start_timeout:.0f} s", r.id, "stall")
 
         if self.phase == "warmup":
             if now - self._phase_start < self.t.warmup_secs or any(r.fps is None for r in live):
@@ -88,7 +89,7 @@ class Controller:
                 since = self._below.setdefault(r.id, now)
                 if now - since >= self.t.fail_secs:
                     return self._fail(f"stream {r.id} fell to {r.fps:.1f} fps, under {self.threshold:.1f} fps "
-                                      f"for {self.t.fail_secs:.0f} s", r.id)
+                                      f"for {self.t.fail_secs:.0f} s", r.id, "capacity")
             else:
                 self._below.pop(r.id, None)
 
@@ -101,6 +102,6 @@ class Controller:
             return Decision("add")
         return Decision("wait")
 
-    def _fail(self, reason: str, stream_id: Optional[int]) -> Decision:
+    def _fail(self, reason: str, stream_id: Optional[int], kind: str) -> Decision:
         self.phase = "failed"
-        return Decision("fail", reason, stream_id)
+        return Decision("fail", reason, stream_id, kind)

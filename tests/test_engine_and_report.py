@@ -17,8 +17,9 @@ FAST = Thresholds(fps_ratio=0.9, ramp_interval=4, fail_secs=2, warmup_secs=2, st
 
 class Machine:
     """A media engine with a fixed total frame rate shared by the running streams (software streams get their own)."""
-    def __init__(self, clock, hw_total=200.0, sw_total=60.0, crash=None):
+    def __init__(self, clock, hw_total=200.0, sw_total=60.0, crash=None, stall=None):
         self.clock, self.hw_total, self.sw_total, self.crash = clock, hw_total, sw_total, crash or set()
+        self.stall = stall or set()   # stream ids that start but never produce a frame
         self.streams = []
 
     def factory(self, info, argv, log_path, source_fps, clock, wall):
@@ -44,7 +45,7 @@ class FakeStream:
         return total / max(1, len(peers))
 
     def poll(self):
-        if self.status == "starting" and self._clock() - self._start >= 1:
+        if self.status == "starting" and self._clock() - self._start >= 1 and self.info.id not in self.m.stall:
             self.status = "running"
         if self.status == "running":
             self.frames += int(self._rate())
@@ -111,8 +112,24 @@ def test_hybrid_finds_hardware_then_software(clock, tmp_path):
 
 def test_a_crash_ends_the_run_as_an_error(clock, tmp_path):
     engine = run(config(), clock, Machine(clock, crash={3}), tmp_path)
-    assert engine.failure["kind"] == "error" and engine.max_stable() == 2
+    assert engine.failure["kind"] == "error" and engine.max_stable() == 2 and engine.stop_reason == "stream-failed"
     assert exit_code(build(engine)) == 1
+
+
+def test_a_stalled_stream_is_replaced_once(clock, tmp_path):
+    engine = run(config(), clock, Machine(clock, stall={4}), tmp_path)
+    assert engine.max_stable() == 9 and engine.failure["kind"] == "capacity"
+    assert engine.streams[3].status == "stopped" and engine.streams[4].info.id == 5
+    report = build(engine)
+    assert any("stream 4 produced no frames" in w for w in report["warnings"]) and exit_code(report) == 0
+
+
+def test_a_second_stall_ends_the_run_without_a_hybrid_pivot(clock, tmp_path):
+    engine = run(config("hybrid"), clock, Machine(clock, stall={4, 5}), tmp_path)
+    assert engine.failure["kind"] == "stall" and engine.stop_reason == "stream-failed"
+    assert engine.hw_max_stable is None and all(s.info.encode_hw for s in engine.streams)
+    report = build(engine)
+    assert report["result"]["limit_reached"] is False and exit_code(report) == 1
 
 
 def test_fixed_mode_counts_streams_keeping_up(clock, tmp_path):

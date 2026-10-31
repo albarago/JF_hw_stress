@@ -65,7 +65,7 @@ def build(engine: Engine, warnings: Optional[List[str]] = None) -> Dict[str, Any
         },
         "result": {
             "stop_reason": engine.stop_reason or None,
-            "limit_reached": engine.failure is not None or engine.stop_reason == "max-streams",
+            "limit_reached": engine.stop_reason in ("limit-reached", "max-streams"),
             "max_stable_streams": engine.max_stable(),
             "hw_max_stable_streams": engine.hw_max_stable,
             "streams_keeping_up": kept_up,
