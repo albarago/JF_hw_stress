@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.0.0 (unreleased)
+## 2.0.0 (2026-10-31)
 
 A rewrite. Several v1 results were wrong (see [the audit](docs/AUDIT-2026-10-31.md)), so v2 numbers are not
 comparable with v1 numbers, and the JSON report has a new layout (`schema_version: 2`).
