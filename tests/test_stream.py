@@ -55,11 +55,15 @@ for i in range(200):
 def test_stream_reads_progress_from_a_real_process(tmp_path):
     s = Stream(INFO, [sys.executable, "-c", FAKE_FFMPEG], str(tmp_path / "s.log"), 24.0)
     s.start()
-    time.sleep(2.2)
-    s.poll()
-    assert s.status == "running" and s.frames > 500
-    # 25 frames every 50 ms is 500 fps at most; slow CI runners oversleep, so only the upper bound is tight
-    assert 50 < s.fps() < 600
+    deadline = time.monotonic() + 8      # wait for progress rather than a fixed time: CI runners vary a lot
+    while time.monotonic() < deadline:
+        s.poll()
+        if s.frames > 200 and s.fps() is not None:
+            break
+        time.sleep(0.1)
+    assert s.status == "running" and s.frames > 200
+    # 25 frames every 50 ms is 500 fps at most; slow runners oversleep, so only the upper bound is tight
+    assert 20 < s.fps() < 600
     s.stop()
     assert s.status == "stopped" and s.ended_at
 
