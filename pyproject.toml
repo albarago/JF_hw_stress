@@ -4,12 +4,51 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jf-hw-stress"
-version = "1.5"
-description = "Jellyfin Hardware Transcode Stress Tester"
+version = "2.0.0"
+description = "Find how many Jellyfin-style hardware transcodes a machine can sustain in real time"
+readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
-classifiers = ["License :: OSI Approved :: MIT License"]
+authors = [{name = "albarago and contributors"}]
+keywords = ["jellyfin", "ffmpeg", "transcoding", "benchmark", "videotoolbox", "nvenc", "quicksync", "vaapi"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video :: Conversion",
+    "Topic :: System :: Benchmark",
+]
 dependencies = ["rich>=13.0"]
 
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff>=0.5"]
+
+[project.urls]
+Homepage = "https://github.com/albarago/JF_hw_stress"
+Issues = "https://github.com/albarago/JF_hw_stress/issues"
+Changelog = "https://github.com/albarago/JF_hw_stress/blob/main/CHANGELOG.md"
+
 [project.scripts]
-jf-hw-stress = "jf_hw_stress:main"
+jf-hw-stress = "jf_hw_stress.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: runs real ffmpeg encodes (needs ffmpeg with libx264)"]
+addopts = "-m 'not integration'"
+
+[tool.ruff]
+line-length = 130
+target-version = "py39"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I"]
+ignore = ["E731", "UP006", "UP007", "UP035", "UP045", "B008"]
