@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.1.0 (unreleased)
+
+### Added
+
+- Output bitrate: each stream's measured bitrate next to its target in the dashboard ("Mbps out"), the average in
+  the summary, headless output and HTML report, and `streams[].output_mbps` and `result.avg_output_mbps` in the JSON
+  report.
+
+### Fixed
+
+- Stopping a run sent ffmpeg a second stop signal, which made it exit at once and leave an empty last segment and an
+  empty playlist behind (seen with `--keep-files`). It now gets one signal and finishes cleanly.
+
 ## 2.0.0 (2026-10-31)
 
 A rewrite. Several v1 results were wrong (see [the audit](docs/AUDIT-2026-10-31.md)), so v2 numbers are not

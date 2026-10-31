@@ -193,7 +193,13 @@ class Stream:
                 self._next_sample = now + 1.0
 
     def signal_stop(self) -> None:
-        """Ask ffmpeg to finish (it flushes and exits); `stop()` then waits for it."""
+        """Ask ffmpeg to finish (it flushes and exits); `stop()` then waits for it.
+
+        Only one signal is sent: ffmpeg treats a second one as "exit immediately" and leaves a
+        truncated playlist and empty segments behind.
+        """
+        if self._stopping:
+            return
         self._stopping = True
         proc = self._proc
         if proc is not None and proc.poll() is None:

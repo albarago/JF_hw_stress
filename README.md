@@ -226,6 +226,11 @@ The headline number is **max stable streams**: the most streams that all stayed 
 ramp interval. In fixed mode it is **streams keeping up**: how many of the N streams had a median frame rate at or
 above the threshold.
 
+**Mbps out** is the bitrate each stream actually produced, measured from its finished segments, next to the target
+(for example `6.0 / 8`). It includes the audio and container overhead, so it is what a client would download.
+Hardware encoders often come in under the target: on an Apple M5, the 8 Mbps HEVC scenario averages about 6 Mbps.
+Jellyfin's dashboard shows the target, not this measured value.
+
 The run ends for one of these reasons (`result.stop_reason` in the JSON):
 
 | Reason | Meaning |

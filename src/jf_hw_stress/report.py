@@ -19,6 +19,10 @@ def _iso(ts: Optional[float]) -> Optional[str]:
     return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def _round(value: Optional[float], digits: int) -> Optional[float]:
+    return None if value is None else round(value, digits)
+
+
 def build(engine: Engine, warnings: Optional[List[str]] = None) -> Dict[str, Any]:
     cfg, src, tools, t = engine.cfg, engine.source, engine.tools, engine.cfg.thresholds
     controller = engine.controller
@@ -32,6 +36,7 @@ def build(engine: Engine, warnings: Optional[List[str]] = None) -> Dict[str, Any
             "decode": {"hw": info.decode_hw}, "tonemap": info.tonemap or None,
             "status": s.status, "started_at": _iso(s.started_at), "ended_at": _iso(s.ended_at),
             "frames": s.frames, "fps": s.fps_summary.to_dict(),
+            "output_mbps": _round(engine.output_mbps(info.id), 2),
             "error": s.error or None,
         })
     kept_up = None
@@ -71,6 +76,7 @@ def build(engine: Engine, warnings: Optional[List[str]] = None) -> Dict[str, Any
             "streams_keeping_up": kept_up,
             "peak_concurrent_streams": engine.peak_concurrent,
             "peak_combined_fps": round(engine.peak_combined_fps, 1),
+            "avg_output_mbps": _round(engine.avg_output_mbps(), 2),
             "failure": engine.failure,
         },
         "io": {"segments_written_mb": round(engine.io.total_bytes / 1e6, 1),
@@ -143,6 +149,12 @@ def _chart(timeline: List[Dict], threshold: float) -> str:
             "Red: per-stream real-time threshold.</p>")
 
 
+def _mbps(value: Optional[float], cfg: Dict[str, Any]) -> str:
+    if value is None:
+        return "per stream (mixed targets)" if cfg["mode"] == "mixed" else "—"
+    return _e(f"{value:.1f} Mbps per stream (video + audio, as delivered)")
+
+
 def render_html(report: Dict[str, Any]) -> str:
     src, cfg, res, ff = report["source"], report["config"], report["result"], report["ffmpeg"]
     thr = cfg["thresholds"]
@@ -161,6 +173,7 @@ def render_html(report: Dict[str, Any]) -> str:
         ("Stopped because", _e(res["stop_reason"])),
         ("Peak streams", _e(res["peak_concurrent_streams"])),
         ("Peak combined fps", _e(res["peak_combined_fps"])),
+        ("Average output bitrate", _mbps(res.get("avg_output_mbps"), cfg)),
         ("Real-time threshold", f"{_e(thr['threshold_fps'])} fps per stream ({_e(round(thr['fps_ratio'] * 100))}% of source)"),
     ])
     hdr = (f"<span class='badge hdr'>{_e(src['hdr_type'])}"
@@ -192,12 +205,13 @@ def render_html(report: Dict[str, Any]) -> str:
         status = f"<span class='badge err'>{_e(s['status'])}</span>" if s["status"] == "error" else _e(s["status"])
         rows.append("<tr>" + "".join(f"<td>{c}</td>" for c in (
             _e(s["id"]), _e(s["scenario_label"]), _e(s["platform"]), _e(s["encode"]["encoder"]), enc, dec,
-            _e(s["tonemap"] or "—"), status, _e(f["p50"]), _e(f["p5"]), _e(f["min"]), _e(f"{s['frames']:,}"))) + "</tr>")
+            _e(s["tonemap"] or "—"), status, _e(f["p50"]), _e(f["p5"]), _e(f["min"]), _e(f"{s['frames']:,}"),
+            _e(s.get("output") or ""), _e("—" if s.get("output_mbps") is None else s["output_mbps"]))) + "</tr>")
         if s.get("error"):
-            rows.append(f"<tr><td></td><td colspan='11' class='note'>{_e(s['error'])}</td></tr>")
+            rows.append(f"<tr><td></td><td colspan='13' class='note'>{_e(s['error'])}</td></tr>")
     table = ("<table><thead><tr>" + "".join(f"<th>{h}</th>" for h in (
         "#", "Scenario", "Platform", "Encoder", "Enc", "Dec", "Tone map", "Status", "Median fps", "5th pct fps",
-        "Min fps", "Frames")) + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
+        "Min fps", "Frames", "Target", "Output Mbps")) + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
     events = "".join(f"<tr><td>{_e(e['t'])} s</td><td>{_e(e['message'])}</td></tr>" for e in report["events"])
     warnings = "".join(f"<p class='note'>{_e(w)}</p>" for w in report["warnings"])
     return (f"<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>"

@@ -266,13 +266,16 @@ def dashboard(engine: Engine, note: str = "") -> Panel:
                 f"{src.bitrate_mbps:.0f} Mbps {src.hdr_type}", style="bold")
     head.append("\n  Target    ", style="dim")
     head.append(f"mixed pool of {len(cfg.pool)}" if cfg.mode == "mixed" else cfg.scenario.label, style="bold green")
+    if cfg.mode != "mixed" and engine.streams:
+        head.append(f"  ({_output_label(engine.streams[0].info.output)})", style="green")
     head.append(f"   {MODE_LABELS[cfg.mode]}", style="cyan")
 
     now = time.monotonic()
     threshold = engine.controller.threshold if engine.controller else src.fps * cfg.thresholds.fps_ratio
     table = Table(box=box.SIMPLE, header_style="bold dim", expand=True)
     for col, just in (("#", "right"), ("Target", "left"), ("Platform", "left"), ("Status", "left"), ("fps", "right"),
-                      ("× real time", "right"), ("Median", "right"), ("Frames", "right"), ("Enc", "center"), ("Dec", "center")):
+                      ("× real time", "right"), ("Median", "right"), ("Frames", "right"), ("Mbps out", "right"),
+                      ("Enc", "center"), ("Dec", "center")):
         table.add_column(col, justify=just)
     for s in engine.streams[-24:]:
         fps = s.fps(now)
@@ -283,15 +286,17 @@ def dashboard(engine: Engine, note: str = "") -> Panel:
         table.add_row(str(s.info.id), esc(s.info.scenario_label), s.info.platform_id, status,
                       f"[{style}]{fps:.1f}[/{style}]" if fps is not None else "[dim]–[/dim]",
                       f"{fps / src.fps:.2f}" if fps and src.fps else "–",
-                      f"{med:.1f}" if med else "–", f"{s.frames:,}",
+                      f"{med:.1f}" if med else "–", f"{s.frames:,}", _mbps_cell(engine.output_mbps(s.info.id), s.info.output),
                       "[green]HW[/green]" if s.info.encode_hw else "[yellow]SW[/yellow]",
                       "[green]HW[/green]" if s.info.decode_hw else "[yellow]SW[/yellow]")
     if len(engine.streams) > 24:
         table.caption = f"showing the newest 24 of {len(engine.streams)} streams"
 
     status = Text()
+    avg_out = engine.avg_output_mbps()
     status.append(f"\n  {len(engine.active)} running   combined {engine.combined_fps():.0f} fps   "
-                  f"reads ~{engine.read_mbps_estimate():.0f} Mbps   writes {engine.io.last_rate / 1e6:.1f} MB/s   "
+                  + (f"output avg {avg_out:.1f} Mbps/stream   " if avg_out is not None else "")
+                  + f"reads ~{engine.read_mbps_estimate():.0f} Mbps   writes {engine.io.last_rate / 1e6:.1f} MB/s   "
                   f"elapsed {engine.elapsed():.0f} s", style="bold")
     c = engine.controller
     if c and not engine.continuous and engine.state == "running":
@@ -310,6 +315,21 @@ def dashboard(engine: Engine, note: str = "") -> Panel:
     footer = Text(f"\n  {note or 'Ctrl+C to stop'}", style="dim")
     return Panel(Group(head, table, status, Text(""), events, footer),
                  title=f"[bold]{APP_TITLE}  v{__version__}[/bold]", border_style="bright_blue")
+
+
+def _output_label(output: str) -> str:
+    """Turn '1920x1080 hevc 8M' into '1920×1080 HEVC 8 Mbps'."""
+    parts = output.split()
+    if len(parts) != 3:
+        return output
+    size, codec, rate = parts
+    return f"{size.replace('x', '×')} {codec.upper()} {rate.rstrip('M')} Mbps"
+
+
+def _mbps_cell(measured: Optional[float], output: str) -> str:
+    target = output.split()[-1].rstrip("M") if output else ""
+    shown = f"{measured:.1f}" if measured is not None else "–"
+    return f"{shown} [dim]/ {target}[/dim]" if target else shown
 
 
 def live_loop(engine: Engine, stop_flag: dict) -> None:
@@ -337,6 +357,9 @@ def summary(engine: Engine, data: dict) -> None:
         console.print(f"  [dim]{esc(res['failure']['reason'])}[/dim]")
     console.print(f"  Peak {res['peak_concurrent_streams']} streams, {res['peak_combined_fps']:.0f} fps combined, "
                   f"stopped: {esc(str(res['stop_reason']))}")
+    if res.get("avg_output_mbps") is not None and engine.streams:
+        console.print(f"  Output {res['avg_output_mbps']:.1f} Mbps per stream on average "
+                      f"(target {_output_label(engine.streams[0].info.output)}, video + audio)")
     for w in data["warnings"]:
         console.print(f"  [yellow]⚠ {esc(w)}[/yellow]")
 

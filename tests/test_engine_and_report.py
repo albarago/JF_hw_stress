@@ -181,6 +181,32 @@ def test_work_dir_removes_only_its_own_files(tmp_path):
     assert remove_work_dir(work)[1] == 1 and (tmp_path / "other" / work / "keep.txt").exists()
 
 
+def test_segment_meter_counts_each_segment_once(tmp_path):
+    from jf_hw_stress.engine import SegmentMeter
+
+    def write(seq, names, durations, end=False):
+        for name in names:
+            path = tmp_path / name
+            if not path.exists():
+                path.write_bytes(b"x" * 1_000_000)          # 1 MB = 8 Mbit per segment
+        lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:4", f"#EXT-X-MEDIA-SEQUENCE:{seq}"]
+        for name, d in zip(names, durations):
+            lines += [f"#EXTINF:{d:.6f},", name]
+        (tmp_path / "s.m3u8").write_text("\n".join(lines + (["#EXT-X-ENDLIST"] if end else [])) + "\n")
+
+    meter = SegmentMeter(str(tmp_path / "s.m3u8"))
+    meter.scan()
+    assert meter.mbps is None                               # no playlist yet
+    write(0, ["s_0.ts", "s_1.ts"], [4.0, 4.0])
+    meter.scan()
+    meter.scan()                                            # scanning again adds nothing
+    assert (meter.segments, meter.mbps) == (2, 2.0)
+    (tmp_path / "s_0.ts").unlink()
+    write(1, ["s_1.ts", "s_2.ts", "s_3.ts"], [4.0, 4.0, 2.0], end=True)
+    meter.scan()
+    assert meter.segments == 4 and meter.mbps == pytest.approx(32 / 14)
+
+
 def test_check_refuses_impossible_runs_before_starting(clock, tmp_path):
     from jf_hw_stress.command import CommandError
     stock = Tools("/bin/ffmpeg", "/bin/ffprobe", "test", "9.0", platforms.Capabilities(

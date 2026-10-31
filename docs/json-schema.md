@@ -71,6 +71,7 @@ measured is `null`.
 | `streams_keeping_up` | Fixed mode: how many streams had a median frame rate at or above the threshold; otherwise `null` |
 | `peak_concurrent_streams` | Most streams running at once |
 | `peak_combined_fps` | Highest per-second sum of all streams' frame rates |
+| `avg_output_mbps` | Average bitrate of the streams' output (video, audio and MPEG-TS overhead, as a client would receive it), in megabits per second of video time. `null` in mixed mode, where each stream has a different target, and before any segment is finished. Added in 2.1.0. |
 | `failure` | `null`, or `{stream, reason, kind}` for what ended the run. `kind` is `capacity` (a stream fell behind), `stall` (a stream produced no frames, twice) or `error` (ffmpeg exited with an error). |
 
 ## `io`
@@ -95,6 +96,7 @@ measured is `null`.
 | `status` | `stopped` (ended by the tool) or `error` (ffmpeg exited on its own) |
 | `started_at`, `ended_at` | Times |
 | `frames` | Frames encoded |
+| `output_mbps` | This stream's average output bitrate, measured from its finished HLS segments and their durations. The target is the last part of `output`. Added in 2.1.0. |
 | `fps` | Once-per-second samples of the 3-second frame rate: `samples`, `min`, `p5`, `p50`, `avg`, `max`. Early samples are high because a stream runs alone or with fewer peers at first; `p50` and `p5` describe the shared load better than `avg`. |
 | `error` | The end of ffmpeg's log when it failed, otherwise `null` |
 

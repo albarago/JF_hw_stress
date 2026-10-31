@@ -49,8 +49,10 @@ def run(cfg: RunConfig, tools: Tools, source: SourceInfo, work_base: str, keep_f
                 break
             if time.monotonic() >= next_status:
                 fps = [f for f in (s.fps() for s in engine.active) if f is not None]
+                avg_out = engine.avg_output_mbps()
                 say(f"{engine.elapsed():6.0f} s  {len(engine.active)} stream(s)  combined {sum(fps):.0f} fps"
                     + (f"  slowest {min(fps):.1f} fps" if fps else "")
+                    + (f"  output {avg_out:.1f} Mbps/stream" if avg_out is not None else "")
                     + (f"  max stable {engine.max_stable()}" if engine.controller else ""))
                 next_status += STATUS_EVERY
             time.sleep(0.2)
@@ -74,6 +76,9 @@ def run(cfg: RunConfig, tools: Tools, source: SourceInfo, work_base: str, keep_f
             + f" (stopped: {res['stop_reason']})")
     else:
         say(f"result: {res['streams_keeping_up']} of {cfg.streams} stream(s) kept up with real time")
+    if res.get("avg_output_mbps") is not None:
+        say(f"output: {res['avg_output_mbps']:.1f} Mbps per stream on average "
+            f"(target {cfg.scenario.bitrate_mbps} Mbps video, plus audio)")
     text = json.dumps(data, indent=2)
     if json_file:
         Path(json_file).write_text(text + "\n", encoding="utf-8")

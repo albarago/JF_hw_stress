@@ -68,6 +68,36 @@ def test_stream_reads_progress_from_a_real_process(tmp_path):
     assert s.status == "stopped" and s.ended_at
 
 
+class CountingProc:
+    """Stands in for Popen: records signals and exits on the first one."""
+    def __init__(self, *args, **kwargs):
+        self.signals, self.code, self.stdout = 0, None, iter(())
+
+    def poll(self):
+        return self.code
+
+    def send_signal(self, sig):
+        self.signals += 1
+        self.code = 0
+
+    terminate = lambda self: self.send_signal(None)   # noqa: E731
+
+    def wait(self, timeout=None):
+        return self.code
+
+
+def test_stop_signals_ffmpeg_only_once(tmp_path):
+    procs = []
+    s = Stream(INFO, ["ffmpeg"], str(tmp_path / "s.log"), 24.0,
+               popen=lambda *a, **k: procs.append(CountingProc()) or procs[-1])
+    s.start()
+    procs[0].code = None
+    s.signal_stop()
+    procs[0].code = None          # still running: the second call must not signal again
+    s.stop()
+    assert procs[0].signals == 1
+
+
 def test_stream_crash_is_reported_with_its_log(tmp_path):
     script = "import sys; sys.stderr.write('Invalid data found when processing input\\n'); sys.exit(1)"
     s = Stream(INFO, [sys.executable, "-c", script], str(tmp_path / "s.log"), 24.0)

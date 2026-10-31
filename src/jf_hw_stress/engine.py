@@ -70,6 +70,52 @@ class IoMeter:
         self._last = now
 
 
+class SegmentMeter:
+    """A stream's average output bitrate: bytes of its finished HLS segments over their playlist durations.
+
+    ffmpeg reports no size or bitrate for HLS output, and streams run faster than real time, so
+    bytes per wall-clock second would overstate it. Segments are counted once, by sequence number;
+    one that was deleted before a scan is skipped, which leaves the average unbiased.
+    """
+    def __init__(self, playlist: str) -> None:
+        self.playlist = Path(playlist)
+        self.bytes = 0
+        self.secs = 0.0
+        self.segments = 0
+        self._last_seq = -1
+
+    def scan(self) -> None:
+        try:
+            lines = self.playlist.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return
+        seq, duration = 0, None
+        for line in (ln.strip() for ln in lines):
+            try:
+                if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                    seq = int(line.split(":", 1)[1])
+                elif line.startswith("#EXTINF:"):
+                    duration = float(line.split(":", 1)[1].split(",")[0])
+                elif line and not line.startswith("#"):
+                    if duration and seq > self._last_seq:
+                        self._last_seq = seq
+                        try:
+                            size = (self.playlist.parent / line).stat().st_size
+                        except OSError:
+                            size = 0
+                        if size:
+                            self.bytes += size
+                            self.secs += duration
+                            self.segments += 1
+                    seq, duration = seq + 1, None
+            except ValueError:
+                return   # a half-written playlist: try again next time
+
+    @property
+    def mbps(self) -> Optional[float]:
+        return self.bytes * 8 / self.secs / 1e6 if self.secs >= 1.0 else None
+
+
 @dataclass
 class Event:
     t: float
@@ -89,6 +135,7 @@ class Engine:
         self._clock, self._wall, self._factory = clock, wall, stream_factory
         self._rng = random.Random(config.seed)
         self.streams: List[Stream] = []
+        self.output: Dict[int, SegmentMeter] = {}   # stream id → output bitrate meter
         self.events: List[Event] = []
         self.timeline: List[Dict] = []
         self._timeline_stride, self._next_sample = 1, 0.0
@@ -157,6 +204,7 @@ class Engine:
         stream = self._factory(info, plan.argv, os.path.join(self.work_dir, f"stream{sid}.log"), self.source.fps,
                                clock=self._clock, wall=self._wall)
         self.streams.append(stream)
+        self.output[sid] = SegmentMeter(plan.playlist)
         stream.start()
         self.peak_concurrent = max(self.peak_concurrent, len(self.active))
         tag = "HW" if plan.encode_hw else "SW"
@@ -269,6 +317,8 @@ class Engine:
             s.stop()
         for s in self.streams:
             s.poll()
+        for meter in self.output.values():
+            meter.scan()        # each ffmpeg closes its last segment on the way out
         self.ended_at = self._wall()
         self.state = "done"
         self.log(f"finished: {self.stop_reason or reason}")
@@ -287,8 +337,23 @@ class Engine:
         now = self._clock()
         return sum(sp for sp in (s.speed(now) for s in self.active) if sp) * self.source.bitrate_mbps
 
+    def output_mbps(self, stream_id: int) -> Optional[float]:
+        meter = self.output.get(stream_id)
+        return meter.mbps if meter else None
+
+    def avg_output_mbps(self) -> Optional[float]:
+        """All streams' segments together; None in mixed mode, where targets differ per stream."""
+        if self.cfg.mode == "mixed":
+            return None
+        secs = sum(m.secs for m in self.output.values())
+        return sum(m.bytes for m in self.output.values()) * 8 / secs / 1e6 if secs >= 1.0 else None
+
     def _sample(self, now: float) -> None:
         self.io.sample(now)
+        for s in self.active:
+            meter = self.output.get(s.info.id)
+            if meter:
+                meter.scan()
         fps_values = [f for f in (s.fps(now) for s in self.active) if f is not None]
         combined = sum(fps_values)
         self.peak_combined_fps = max(self.peak_combined_fps, combined)
