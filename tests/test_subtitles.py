@@ -1,5 +1,7 @@
 """Subtitle burn-in: probing, choosing, preparing, and the command lines for each backend."""
+import sys
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -291,10 +293,9 @@ def test_looping_uses_the_concat_list_when_there_is_one():
 def test_streams_restart_when_they_reach_the_end_of_the_loop_list(tmp_path):
     from jf_hw_stress.stream import Stream, StreamInfo
     info = StreamInfo(1, "x", "x", "sw", "Software", "libx264", False, False, "", "640x360 h264 2M")
-    script = tmp_path / "fake-ffmpeg.sh"
-    script.write_text("#!/bin/sh\nprintf 'frame=50\\nprogress=continue\\nframe=100\\nprogress=end\\n'\n")
-    script.chmod(0o755)
-    stream = Stream(info, [str(script)], str(tmp_path / "s.log"), 24.0)
+    script = tmp_path / "fake_ffmpeg.py"   # prints two progress blocks and exits 0, like ffmpeg at the end of input
+    script.write_text("print('frame=50\\nprogress=continue\\nframe=100\\nprogress=end', flush=True)\n")
+    stream = Stream(info, [sys.executable, str(script)], str(tmp_path / "s.log"), 24.0)
     stream.restart_on_end = True
     stream.start()
     import time
@@ -326,7 +327,7 @@ def test_engine_prepares_the_sample_once_and_cleans_up(tmp_path):
     engine = Engine(cfg, tools, SDR_1080, str(tmp_path), stream_factory=lambda *a, **k: None)
     engine.write_loop_list()
     engine.prepare_burn_in()
-    assert engine.burn.text_file.endswith("burnin/sample.ass") and engine.burn.events == 16200   # 6 h of source
+    assert Path(engine.burn.text_file).parts[-2:] == ("burnin", "sample.ass") and engine.burn.events == 16200   # 6 h
     assert (tmp_path / "loop.ffconcat").is_file() and engine.loop_input.endswith("loop.ffconcat")
     assert "burning in subtitles: built-in sample" in engine.events[-1].message
     plan = engine.plan(COMPAT, platforms.VIDEOTOOLBOX, software=False, stream_id=1)
