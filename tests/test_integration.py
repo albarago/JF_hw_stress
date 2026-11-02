@@ -39,6 +39,8 @@ def test_fixed_software_run_produces_a_valid_report(clip, tmp_path, capsys):
 
 
 def _has_libass() -> bool:
+    if not shutil.which("ffmpeg"):
+        return False
     out = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True).stdout
     return any(line.split()[1:2] == ["subtitles"] for line in out.splitlines() if line.strip())
 
