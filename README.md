@@ -24,6 +24,7 @@ hardware tone mapping: 11 streams at the same time, each at 90% of real time or 
 - [Hardware support](#hardware-support)
 - [Which ffmpeg to use](#which-ffmpeg-to-use)
 - [Choosing a source file](#choosing-a-source-file)
+- [Subtitle burn-in](#subtitle-burn-in)
 - [Work folder and disk writes](#work-folder-and-disk-writes)
 - [Reading the results](#reading-the-results)
 - [Automation (CI, Kubernetes, scripts)](#automation-ci-kubernetes-scripts)
@@ -40,9 +41,11 @@ Streams run as fast as the hardware allows, and they share it. The tool measures
 the last 3 seconds. A stream passes while it stays at or above the **threshold**: 90% of the source frame rate
 by default (21.6 fps for a 23.976 fps film). Use `--fps-ratio 1.0` for a strict real-time threshold.
 
+With `--burn-in`, every stream also draws subtitles into the video, as Jellyfin does for clients that can't show
+them (see [Subtitle burn-in](#subtitle-burn-in)).
+
 It does **not** measure:
 
-- subtitle burn-in, which Jellyfin does for some subtitle formats and which costs more;
 - Jellyfin's own overhead, network delivery to clients, or other server work (library scans, trickplay);
 - direct play, which costs almost nothing;
 - reading many different files from disk. Every stream reads the same file, so after the first pass it usually
@@ -103,6 +106,9 @@ jf-hw-stress --headless --source movie.mkv --scenario 4k_hdr_sdr \
 
 # Check that 6 streams of 1080p → H.264 hold up for 10 minutes
 jf-hw-stress --headless --source movie.mkv --mode fixed --streams 6 --duration 600
+
+# The same limit test with the file's subtitles burned in
+jf-hw-stress --headless --source anime.mkv --burn-in auto
 
 # See what this machine and ffmpeg build can use
 jf-hw-stress --list-platforms
@@ -167,6 +173,9 @@ but haven't been run on that hardware yet. If you have it, a test run and a repo
 CPU tone mapping (`zscale`) is slow: about 112 fps for 4K on an M5 against 233 fps on its GPU. When the report says
 `"tonemap": "software"`, the CPU may be the limit, not the GPU.
 
+Subtitle burn-in on the GPU uses `overlay_videotoolbox` (tested), `overlay_cuda`, `overlay_qsv` or `overlay_vaapi`
+(untested, built from Jellyfin's command lines). See [Subtitle burn-in](#subtitle-burn-in).
+
 Hardware decoding is used when the backend supports the source codec. `--no-hw-decode` decodes on the CPU and
 encodes on the GPU.
 
@@ -198,9 +207,59 @@ larger file without re-encoding:
 ffmpeg -ss 1800 -t 300 -i movie.mkv -map 0 -c copy clip.mkv
 ```
 
+`-map 0` keeps the subtitle tracks and embedded fonts, which [subtitle burn-in](#subtitle-burn-in) needs.
+
 Dolby Vision profile 7 (UHD Blu-ray) and 8 files are decoded as their HDR10 base layer, as Jellyfin does. Profile 5
 has no HDR10 base layer; its colours are only correct with a Dolby Vision-aware tone mapper, and the tool warns
 about it.
+
+## Subtitle burn-in
+
+Jellyfin burns subtitles into the video when the client can't show them itself. This is common with PGS
+subtitles from Blu-rays and with styled ASS subtitles from anime, and it makes Jellyfin transcode files the
+client could otherwise play directly. `--burn-in` adds the same work to every stream:
+
+```sh
+jf-hw-stress --headless --source anime.mkv --list-subtitles        # the tracks, numbered from 0
+jf-hw-stress --headless --source anime.mkv --burn-in auto          # the default (or first) track
+jf-hw-stress --headless --source film.mkv --burn-in 1              # subtitle track 1
+jf-hw-stress --headless --source film.mkv --burn-in film.en.srt    # an external file (.ass .ssa .srt .vtt .sup)
+jf-hw-stress --headless --source film.mkv --burn-in sample         # built-in styled ASS, for files without subtitles
+```
+
+The interactive setup asks after the audio question. It works the way Jellyfin's `EncodingHelper` does:
+
+- **Text subtitles** (ASS, SSA, SRT, WebVTT) are extracted to a file once, before the run, together with the
+  file's embedded fonts. libass then draws them (`subtitles=`).
+- **Picture subtitles** (PGS, VobSub, DVB) go into the filter graph, are scaled to the output size and laid
+  over the video.
+- When decoding and encoding are both on the GPU, the subtitles are drawn on a transparent layer, uploaded and
+  overlaid on the GPU: `overlay_videotoolbox`, `overlay_cuda`, `overlay_qsv` or `overlay_vaapi`. Otherwise they
+  are drawn on the CPU (`subtitles=` in the chain, or `overlay`), which is also what happens when the ffmpeg build
+  lacks the GPU overlay filter. Each stream's report says which (`streams[].burn_in`).
+- Subtitles are drawn after scaling and tone mapping, as in Jellyfin.
+
+The source is looped, so text subtitles are repeated with shifted times to keep them on screen after the first
+pass. Picture subtitles loop with the video.
+
+`sample` is a worst case: two lines of dialogue on screen at all times, plus a moving, rotating, blurred sign
+and a karaoke line, so libass redraws every frame. Real dialogue subtitles cost much less.
+
+What it measured on a MacBook Air (Apple M5, VideoToolbox, jellyfin-ffmpeg 8.1), 1080p → H.264 8 Mbps:
+
+| Source | Without burn-in | With burn-in |
+|---|---|---|
+| H.264 anime episode, ASS dialogue with 21 embedded fonts | 12 streams | 12 streams |
+| HEVC 10-bit film, PGS | 12 streams | 12 streams |
+| AV1 10-bit anime film, typeset ASS | 12 streams | 11 streams |
+| H.264, `sample` | — | 12 streams (one stream alone: 154 fps instead of 272 fps) |
+
+On this machine the media engine is the limit, and libass runs on the CPU cores beside it, so burn-in barely
+changes the count. On a machine with a weaker CPU, or a GPU that also does the subtitle work (an Intel iGPU), the
+difference can be larger. That's worth measuring on your own hardware.
+
+Not covered: DVB teletext and closed captions (nothing to draw), and Jellyfin's Vulkan overlay for AMD on Linux
+(VA-API here uses `overlay_vaapi`, Jellyfin's Intel path). AMF burns in on the CPU; Jellyfin uses OpenCL.
 
 ## Work folder and disk writes
 

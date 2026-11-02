@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.2.0 (unreleased)
+
+### Added
+
+- **Subtitle burn-in** ([#3](https://github.com/albarago/JF_hw_stress/issues/3)). `--burn-in auto|N|sample|FILE`
+  draws subtitles into every stream, as Jellyfin does for clients that can't show them. It works with text
+  subtitles (ASS/SSA with their embedded fonts, SRT, WebVTT) and picture subtitles (PGS, VobSub, DVB), from the
+  source's tracks or from an external file. `sample` is a built-in styled ASS worst case for files without
+  subtitles. The interactive setup asks for it too.
+  - The filter chains follow Jellyfin's `EncodingHelper`. Subtitles are overlaid on the GPU when decode and
+    encode are both on it (`overlay_videotoolbox`, `overlay_cuda`, `overlay_qsv`, `overlay_vaapi`), and drawn on
+    the CPU otherwise.
+  - Looped text subtitles are repeated with shifted times, so they stay on screen after the first pass.
+- `--list-subtitles` lists the source's subtitle tracks, numbered as `--burn-in` takes them. Headless runs and the
+  setup screen show them too.
+- JSON report: `source.subtitles`, `source.font_attachments`, `config.burn_in` and `streams[].burn_in` (how each
+  stream draws them). The HTML report shows them.
+
+### Fixed
+
+- **Some sources stopped after one pass on VideoToolbox.** With H.264 sources and jellyfin-ffmpeg 8.1,
+  `-stream_loop` resets the decoder at the end of the file and the frames come back in a different format. The
+  filters then failed ("hwaccel changed"), and the stream ended with an error at the loop point.
+  - The source is now looped with a concat list instead, which keeps one decoder for the whole run.
+  - A stream that gets through the whole list (6 hours of source) starts again.
+  - Sources with an unknown length still use `-stream_loop`.
+
 ## 2.1.0 (2026-10-31)
 
 ### Added

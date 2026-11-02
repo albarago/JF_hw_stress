@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jf-hw-stress"
-version = "2.1.0"
+version = "2.2.0"
 description = "Find how many Jellyfin-style hardware transcodes a machine can sustain in real time"
 readme = "README.md"
 requires-python = ">=3.9"

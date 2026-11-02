@@ -23,6 +23,7 @@ from . import APP_TITLE, __version__
 from . import platforms as plat
 from . import report as reports
 from . import scenarios as scn
+from . import subtitles as subs
 from . import tools as tl
 from .command import CommandError, Options
 from .controller import Thresholds
@@ -168,6 +169,32 @@ def show_source(source: SourceInfo) -> None:
         console.print(f"  Length   {source.duration_secs / 60:.1f} min  [dim](looped during the test)[/dim]")
     for note in dovi_notes(source.dovi_profile):
         console.print(f"  [yellow]⚠[/yellow] [dim]{esc(note)}[/dim]")
+    for i, line in enumerate(subs.subtitle_lines(source)):
+        console.print(f"  {'Subtitles' if i == 0 else '         '} {esc(line.strip())}")
+
+
+def choose_burn_in(source: SourceInfo, preset: Optional[str]) -> Optional[subs.BurnIn]:
+    if preset:
+        return subs.resolve(preset, source)
+    rule("Subtitle burn-in")
+    console.print("  Jellyfin burns subtitles into the video when a client can't show them itself (often PGS from\n"
+                  "  Blu-rays, or styled ASS from anime). It costs extra work per stream.\n")
+    choices = ["none"]
+    for t in source.subtitles:
+        if t.burnable:
+            console.print(f"  [bold]{t.number}[/bold]  {esc(t.label())}  [dim]{'picture' if t.is_image else 'text'}[/dim]")
+            choices.append(str(t.number))
+    console.print("  [bold]sample[/bold]  built-in styled ASS (signs, karaoke), for files without subtitles")
+    console.print("  [bold]file[/bold]    a .ass/.ssa/.srt/.vtt/.sup file\n")
+    while True:
+        pick = Prompt.ask("  Burn in", choices=choices + ["sample", "file"], default="none")
+        if pick == "none":
+            return None
+        spec = clean_path(Prompt.ask("  Subtitle file")) if pick == "file" else pick
+        try:
+            return subs.resolve(spec, source)
+        except subs.BurnInError as exc:
+            console.print(f"  [red]✗ {esc(str(exc))}[/red]")
 
 
 def choose_work_dir(preset: Optional[str]) -> str:
@@ -247,10 +274,12 @@ def setup(source: SourceInfo, platforms: List[plat.Platform], tools: tl.Tools, a
                       + ("[green]supported[/green]" if supported else "[yellow]not supported, software decode[/yellow]"))
         hw_decode = supported and Confirm.ask("  Decode on the hardware?", default=True)
     audio = Prompt.ask("  Audio", choices=["aac", "copy", "none"], default="aac")
+    burn = choose_burn_in(source, getattr(args, "burn_in", None))
     return RunConfig(mode=mode, scenario=scenario, platforms=platforms, pool=pool, streams=streams,
                      hw_decode=hw_decode, options=Options(hls_segment_secs=args.hls_segment, audio=audio,
                                                           realtime=args.realtime, loop=not args.no_loop),
-                     thresholds=thresholds, duration=duration, max_streams=args.max_streams, seed=args.seed)
+                     thresholds=thresholds, duration=duration, max_streams=args.max_streams, seed=args.seed,
+                     burn_in=burn)
 
 
 # --- dashboard -------------------------------------------------------------------------------
@@ -269,6 +298,12 @@ def dashboard(engine: Engine, note: str = "") -> Panel:
     if cfg.mode != "mixed" and engine.streams:
         head.append(f"  ({_output_label(engine.streams[0].info.output)})", style="green")
     head.append(f"   {MODE_LABELS[cfg.mode]}", style="cyan")
+    if cfg.burn_in is not None:
+        head.append("\n  Subtitles ", style="dim")
+        head.append(cfg.burn_in.label, style="bold yellow")
+        how = sorted({s.info.burn_in for s in engine.streams if s.info.burn_in})
+        if how:
+            head.append(f"  burned in on {' / '.join(how)}", style="yellow")
 
     now = time.monotonic()
     threshold = engine.controller.threshold if engine.controller else src.fps * cfg.thresholds.fps_ratio
@@ -414,7 +449,7 @@ def run_interactive(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         console.print("\n  [yellow]Stopped.[/yellow]")
         return 130
-    except (tl.ToolError, plat.PlatformError, ProbeError, CommandError, OSError) as exc:
+    except (tl.ToolError, plat.PlatformError, ProbeError, CommandError, subs.BurnInError, OSError) as exc:
         console.print(f"\n  [red]✗ {esc(str(exc))}[/red]")
         return 2
     finally:

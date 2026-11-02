@@ -23,6 +23,18 @@ def _round(value: Optional[float], digits: int) -> Optional[float]:
     return None if value is None else round(value, digits)
 
 
+def _burn_in(engine: Engine) -> Optional[Dict[str, Any]]:
+    if engine.cfg.burn_in is None:
+        return None
+    data = engine.cfg.burn_in.to_dict()
+    prep = engine.burn
+    data.update({"events": prep.events if prep and prep.burn.is_text else None,
+                 "repeats": prep.repeats if prep and prep.burn.is_text else None,
+                 "embedded_fonts": bool(prep and prep.fonts_dir),
+                 "canvas": f"{prep.canvas[0]}x{prep.canvas[1]}" if prep and prep.canvas[0] else None})
+    return data
+
+
 def build(engine: Engine, warnings: Optional[List[str]] = None) -> Dict[str, Any]:
     cfg, src, tools, t = engine.cfg, engine.source, engine.tools, engine.cfg.thresholds
     controller = engine.controller
@@ -34,6 +46,7 @@ def build(engine: Engine, warnings: Optional[List[str]] = None) -> Dict[str, Any
             "platform": info.platform_id, "output": info.output,
             "encode": {"hw": info.encode_hw, "encoder": info.encoder},
             "decode": {"hw": info.decode_hw}, "tonemap": info.tonemap or None,
+            "burn_in": info.burn_in or None,
             "status": s.status, "started_at": _iso(s.started_at), "ended_at": _iso(s.ended_at),
             "frames": s.frames, "fps": s.fps_summary.to_dict(),
             "output_mbps": _round(engine.output_mbps(info.id), 2),
@@ -67,6 +80,7 @@ def build(engine: Engine, warnings: Optional[List[str]] = None) -> Dict[str, Any
                            "ramp_interval_secs": t.ramp_interval, "fail_secs": t.fail_secs,
                            "warmup_secs": t.warmup_secs},
             "duration_limit_secs": cfg.duration, "max_streams": cfg.max_streams, "seed": cfg.seed,
+            "burn_in": _burn_in(engine),
         },
         "result": {
             "stop_reason": engine.stop_reason or None,
@@ -155,6 +169,16 @@ def _mbps(value: Optional[float], cfg: Dict[str, Any]) -> str:
     return _e(f"{value:.1f} Mbps per stream (video + audio, as delivered)")
 
 
+def _burn_in_html(burn: Optional[Dict[str, Any]], streams: List[Dict[str, Any]]) -> str:
+    if not burn:
+        return "none"
+    how = sorted({s["burn_in"] for s in streams if s.get("burn_in")})
+    detail = [f"{burn['events']} lines" + (f", repeated {burn['repeats']}×" if (burn.get("repeats") or 1) > 1 else "")
+              if burn.get("events") else "", "embedded fonts" if burn.get("embedded_fonts") else "",
+              f"drawn on {' / '.join(how)}" if how else ""]
+    return _e(burn["label"]) + "".join(f"<br><span class='meta'>{_e(d)}</span>" for d in detail if d)
+
+
 def render_html(report: Dict[str, Any]) -> str:
     src, cfg, res, ff = report["source"], report["config"], report["result"], report["ffmpeg"]
     thr = cfg["thresholds"]
@@ -186,6 +210,8 @@ def render_html(report: Dict[str, Any]) -> str:
         ("Frame rate", _e(f"{src['fps']} fps")), ("Bitrate", _e(f"{src['bitrate_mbps']} Mbps")),
         ("Dynamic range", hdr), ("Transfer / primaries", _e(f"{src['color_transfer']} / {src['color_primaries']}")),
         ("Audio", _e(src.get("audio_codec") or "none")),
+        ("Subtitles", "<br>".join(_e(f"{t['number']}: {t['codec']} {t['language']} {t['title']} ({t['kind']})".strip())
+                                  for t in src.get("subtitles") or []) or "none"),
     ])
     setup = _kv([
         ("Mode", _e(MODE_LABELS.get(cfg["mode"], cfg["mode"]))),
@@ -196,6 +222,7 @@ def render_html(report: Dict[str, Any]) -> str:
         ("Audio", _e(cfg["audio"])), ("Source read", "real-time (-re)" if cfg["realtime"] else "as fast as possible"),
         ("HLS segment", _e(f"{cfg['hls']['segment_secs']} s")),
         ("Ramp / fail / warm-up", _e(f"{thr['ramp_interval_secs']} s / {thr['fail_secs']} s / {thr['warmup_secs']} s")),
+        ("Subtitle burn-in", _burn_in_html(cfg.get("burn_in"), report["streams"])),
     ])
     rows = []
     for s in report["streams"]:

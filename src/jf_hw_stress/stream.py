@@ -110,6 +110,7 @@ class StreamInfo:
     decode_hw: bool
     tonemap: str
     output: str
+    burn_in: str = ""            # how subtitles are drawn into this stream, "" = none
 
 
 class Stream:
@@ -136,16 +137,24 @@ class Stream:
         self._proc: Optional[subprocess.Popen] = None
         self._log = None
         self._reader: Optional[threading.Thread] = None
+        # A looped source is a finite list of copies; when ffmpeg gets to the end of it (exit 0), the same
+        # command starts again and the frame count carries on, so the load stays the same.
+        self.restart_on_end = False
+        self.restarts = 0
+        self._frame_base = 0
 
     # --- lifecycle ----------------------------------------------------------------------------
     def start(self) -> None:
         self._log = open(self.log_path, "w", encoding="utf-8", errors="replace")
+        self.started_at, self.started_mono = self._wall(), self._clock()
+        self._spawn()
+
+    def _spawn(self) -> None:
         kwargs = {}
         if os.name == "posix":
             kwargs["start_new_session"] = True     # Ctrl+C reaches us, not every ffmpeg directly
         else:
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        self.started_at, self.started_mono = self._wall(), self._clock()
         try:
             self._proc = self._popen(self.argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=self._log,
                                      text=True, errors="replace", bufsize=1, **kwargs)
@@ -157,14 +166,17 @@ class Stream:
 
     def _read(self) -> None:
         parser = ProgressParser()
-        assert self._proc is not None and self._proc.stdout is not None
-        for line in self._proc.stdout:
+        proc = self._proc
+        assert proc is not None and proc.stdout is not None
+        base = self._frame_base
+        for line in proc.stdout:
             block = parser.feed(line)
             if block is None:
                 continue
             frame = _int(block.get("frame"))
             if frame is None:
                 continue
+            frame += base
             now = self._clock()
             with self._lock:
                 self.frames = frame
@@ -178,6 +190,9 @@ class Stream:
         with self._lock:
             if self._proc is not None and self.status in ("starting", "running"):
                 code = self._proc.poll()
+                if code == 0 and self.restart_on_end and not self._stopping and self.frames > self._frame_base:
+                    self._restart()
+                    code = None
                 if code is not None:
                     self.exit_code = code
                     self.ended_at = self._wall()
@@ -191,6 +206,21 @@ class Stream:
                 if rate is not None:
                     self.fps_summary.add(rate)
                 self._next_sample = now + 1.0
+
+    def _restart(self) -> None:
+        """ffmpeg finished the looped source: run the same command again (called with the lock held)."""
+        if self._reader is not None:
+            self._lock.release()
+            try:
+                self._reader.join(timeout=STOP_GRACE)   # the last progress lines are counted first
+            finally:
+                self._lock.acquire()
+        self._frame_base = self.frames
+        self.restarts += 1
+        if self._log is not None:
+            self._log.write(f"\n[jf-hw-stress] end of the looped source; restart {self.restarts}\n")
+            self._log.flush()
+        self._spawn()
 
     def signal_stop(self) -> None:
         """Ask ffmpeg to finish (it flushes and exits); `stop()` then waits for it.

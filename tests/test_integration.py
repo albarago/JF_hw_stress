@@ -38,6 +38,32 @@ def test_fixed_software_run_produces_a_valid_report(clip, tmp_path, capsys):
     assert not any(p.name.startswith("jf-hw-stress-") for p in tmp_path.iterdir())   # run folder removed
 
 
+def _has_libass() -> bool:
+    out = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True).stdout
+    return any(line.split()[1:2] == ["subtitles"] for line in out.splitlines() if line.strip())
+
+
+@pytest.mark.skipif(not _has_libass(), reason="this ffmpeg has no libass (subtitles filter)")
+@pytest.mark.parametrize("spec", ["auto", "sample"])
+def test_burn_in_run_draws_subtitles_past_the_loop(clip, tmp_path, spec):
+    from jf_hw_stress.subtitles import sample_ass
+    subbed = tmp_path / "subbed.mkv"
+    (tmp_path / "s.ass").write_text(sample_ass(4), encoding="utf-8")
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(clip), "-i", str(tmp_path / "s.ass"),
+                    "-map", "0", "-map", "1", "-c", "copy", str(subbed)], check=True)
+    out = tmp_path / "r.json"
+    code = main(["--headless", "--source", str(subbed), "--platform", "sw", "--mode", "fixed", "--streams", "1",
+                 "--scenario", "480p_remote", "--duration", "8", "--burn-in", spec, "--work-dir", str(tmp_path),
+                 "--json-file", str(out)])
+    assert code == 0
+    report = json.loads(out.read_text())
+    stream = report["streams"][0]
+    assert stream["burn_in"] == "CPU, libass" and stream["frames"] > 48 and stream["status"] == "stopped"
+    assert report["config"]["burn_in"]["origin"] == ("track" if spec == "auto" else "sample")
+    assert report["source"]["subtitles"][0]["kind"] == "text"
+    assert not any(p.name.startswith("jf-hw-stress-") for p in tmp_path.iterdir())   # run folder removed
+
+
 def test_escalating_software_run_reaches_a_limit_or_the_duration(clip, tmp_path):
     out = tmp_path / "r.json"
     code = main(["--headless", "--source", str(clip), "--platform", "sw", "--scenario", "480p_remote",

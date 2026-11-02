@@ -15,12 +15,15 @@ from .command import AUDIO_MODES, CommandError, Options
 from .controller import Thresholds
 from .engine import MODES, RunConfig
 from .probe import ProbeError, dovi_notes, probe
+from .subtitles import BurnInError, subtitle_lines
+from .subtitles import resolve as resolve_burn_in
 
 EPILOG = """\
 examples:
   jf-hw-stress                                          interactive setup and live dashboard
   jf-hw-stress --headless --source movie.mkv --json     escalate until the limit, JSON on stdout
   jf-hw-stress --headless --source movie.mkv --mode fixed --streams 6 --duration 120 --html-report r.html
+  jf-hw-stress --headless --source anime.mkv --burn-in auto   with the file's subtitles burned in
   jf-hw-stress --list-platforms                         what this machine and ffmpeg build support
 
 exit codes: 0 result produced · 1 the run failed (a stream crashed or stalled, or none kept up) · 2 setup error
@@ -50,6 +53,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--no-hw-decode", action="store_true", help="decode in software, encode on the hardware")
     p.add_argument("--audio", choices=AUDIO_MODES, default="aac",
                    help="aac: re-encode to stereo AAC like most clients (default) · copy · none")
+    p.add_argument("--burn-in", metavar="SUBS",
+                   help="burn subtitles into every stream, as Jellyfin does for clients that can't show them: "
+                        "auto (the source's default or first subtitle track), a track number (0 = first subtitle "
+                        "track; see --list-subtitles), sample (built-in styled ASS), or a .ass/.ssa/.srt/.vtt/.sup file")
+    p.add_argument("--list-subtitles", action="store_true", help="list the source's subtitle tracks and exit (needs --source)")
     p.add_argument("--realtime", action="store_true", help="read the source at playback speed (-re)")
     p.add_argument("--no-loop", action="store_true", help="do not loop the source (streams end with the file)")
     p.add_argument("--duration", type=float, metavar="SECS", help="stop after this many seconds (default: at the limit)")
@@ -107,6 +115,16 @@ def list_scenarios() -> None:
             print(f"{s.id:<18} {s.label:<22} {s.codec:<5} {s.width:>5} {s.bitrate:>8}  {'yes' if s.tonemap else '-'}")
 
 
+def list_subtitles(tools: tl.Tools, path: str) -> None:
+    source = probe(tools.ffprobe, path)
+    if not source.subtitles:
+        print("no subtitle tracks (use --burn-in sample or a subtitle file)")
+        return
+    print("  #  track                                    kind")
+    for line in subtitle_lines(source):
+        print(line)
+
+
 def list_platforms(tools: tl.Tools) -> None:
     print(f"ffmpeg {tools.version} ({tools.origin})\n  {tools.ffmpeg}\n")
     for p, reason in plat.describe_support(tools.caps):
@@ -157,9 +175,15 @@ def headless(args: argparse.Namespace) -> int:
             hl.say("note: " + note)
         if notes and source.dovi_profile not in (7, 8):   # profile 5 or unknown: colours may be wrong
             warnings.append(notes[0])
+        if source.subtitles:
+            hl.say(f"subtitles: {len(source.subtitles)} track(s): "
+                   + "; ".join(f"{t.number} {t.label()}" for t in source.subtitles))
         if not source.fps:
             hl.say("the source frame rate is unknown, so there is no real-time threshold")
             return hl.EXIT_SETUP
+        burn = resolve_burn_in(args.burn_in, source) if args.burn_in else None
+        if burn:
+            hl.say(f"burn-in: {burn.label}")
         if args.mode == "mixed":
             pool = scn.mixed_pool(source)
             if not pool:
@@ -183,10 +207,10 @@ def headless(args: argparse.Namespace) -> int:
                             realtime=args.realtime),
             thresholds=Thresholds(fps_ratio=args.fps_ratio, ramp_interval=args.ramp_interval,
                                   fail_secs=args.fail_secs, warmup_secs=args.warmup_secs),
-            duration=args.duration, max_streams=args.max_streams, seed=args.seed)
+            duration=args.duration, max_streams=args.max_streams, seed=args.seed, burn_in=burn)
         return hl.run(cfg, tools, source, args.work_dir or default_work_base(), keep_files=args.keep_files,
                       json_stdout=args.json, json_file=args.json_file, html_file=args.html_report, warnings=warnings)
-    except (tl.ToolError, plat.PlatformError, ProbeError, CommandError, ValueError, OSError) as exc:
+    except (tl.ToolError, plat.PlatformError, ProbeError, CommandError, BurnInError, ValueError, OSError) as exc:
         hl.say(f"error: {exc}")
         return hl.EXIT_SETUP
 
@@ -219,6 +243,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             list_platforms(find_tools(args.ffmpeg))
         except tl.ToolError as exc:
+            print(f"jf-hw-stress: {exc}", file=sys.stderr)
+            return 2
+        return 0
+    if args.list_subtitles:
+        if not args.source:
+            print("jf-hw-stress: --list-subtitles needs --source FILE", file=sys.stderr)
+            return 2
+        try:
+            list_subtitles(find_tools(args.ffmpeg), str(Path(args.source).expanduser()))
+        except (tl.ToolError, ProbeError) as exc:
             print(f"jf-hw-stress: {exc}", file=sys.stderr)
             return 2
         return 0

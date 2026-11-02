@@ -4,6 +4,7 @@ The caller drives it: `start()`, then `tick()` a few times a second until `state
 """
 from __future__ import annotations
 
+import math
 import os
 import random
 import time
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from . import command
+from . import subtitles as subs
 from .controller import Controller, Reading, Thresholds
 from .platforms import SOFTWARE, Platform
 from .probe import SourceInfo
@@ -22,6 +24,7 @@ from .tools import Tools
 MODES = ("fixed", "escalating", "hybrid", "mixed")
 MODE_LABELS = {"fixed": "Fixed", "escalating": "Escalating", "hybrid": "Hybrid HW → SW", "mixed": "Mixed"}
 STALL_RETRIES = 1     # a stream that never produces a frame is replaced this many times before the run fails
+MAX_LOOP_COPIES = 20_000
 
 
 @dataclass
@@ -37,6 +40,7 @@ class RunConfig:
     duration: Optional[float] = None          # seconds; None = until the limit or a stop
     max_streams: int = 64
     seed: Optional[int] = None
+    burn_in: Optional[subs.BurnIn] = None     # subtitles drawn into every stream
 
 
 class IoMeter:
@@ -155,6 +159,8 @@ class Engine:
         self._hw_platforms = [p for p in config.platforms if p.is_hardware] or [SOFTWARE]
         self._rr = 0
         self._stall_retries = 0
+        self.burn: Optional[subs.Prepared] = None
+        self.loop_input = ""             # the ffconcat list that loops the source, once written
         self.controller: Optional[Controller] = None
         if config.mode != "fixed":
             self.controller = Controller(source.fps, config.thresholds, clock)
@@ -178,7 +184,37 @@ class Engine:
     def plan(self, scenario: Scenario, platform: Platform, software: bool, stream_id: int = 0) -> command.Plan:
         return command.build(platform, scenario, self.source, self.tools.caps, self.tools.ffmpeg, stream_id,
                              self.work_dir, self.cfg.options,
-                             hw_decode=self.cfg.hw_decode and not software, hw_encode=not software)
+                             hw_decode=self.cfg.hw_decode and not software, hw_encode=not software, burn=self.burn,
+                             loop_input=self.loop_input)
+
+    def cover_secs(self) -> float:
+        """How much of the source the loop list (and repeated subtitles) cover. This is source time, not wall
+        time: streams run faster than real time, so a stream can get through it in minutes. It then restarts."""
+        return subs.COVER_SECS
+
+    def write_loop_list(self) -> None:
+        if not self.cfg.options.loop or self.source.duration_secs <= 0 or self.loop_input:
+            return
+        copies = min(MAX_LOOP_COPIES, max(2, math.ceil(self.cover_secs() / self.source.duration_secs) + 1))
+        path = Path(self.work_dir) / command.LOOP_FILE
+        path.write_text(command.loop_list(str(Path(self.source.path).resolve()), self.source.duration_secs, copies),
+                        encoding="utf-8")
+        self.loop_input = str(path)
+
+    def prepare_burn_in(self) -> None:
+        """Extract the subtitles (and their fonts) once, before any stream starts."""
+        if self.cfg.burn_in is None or self.burn is not None:
+            return
+        self.burn = subs.prepare(self.cfg.burn_in, self.tools.ffmpeg, self.tools.ffprobe, self.source,
+                                 self.work_dir, self.cfg.options.loop, cover_secs=self.cover_secs())
+        detail = ""
+        if self.burn.burn.is_text:
+            detail = f", {self.burn.events} lines"
+            if self.burn.repeats > 1:
+                detail += f" repeated {self.burn.repeats}× to follow the looped source"
+            if self.burn.fonts_dir:
+                detail += f", {len(list(Path(self.burn.fonts_dir).iterdir()))} embedded fonts"
+        self.log(f"burning in subtitles: {self.cfg.burn_in.label}{detail}")
 
     def check(self) -> None:
         """Build every command this run can use before starting anything, so errors come first."""
@@ -200,20 +236,25 @@ class Engine:
         plan = self.plan(scenario, platform, software or not platform.is_hardware, sid)
         info = StreamInfo(id=sid, scenario_id=scenario.id, scenario_label=scenario.label, platform_id=platform.id,
                           platform_name=platform.name, encoder=plan.encoder, encode_hw=plan.encode_hw,
-                          decode_hw=plan.decode_hw, tonemap=plan.tonemap, output=plan.output)
+                          decode_hw=plan.decode_hw, tonemap=plan.tonemap, output=plan.output,
+                          burn_in=plan.burn_in)
         stream = self._factory(info, plan.argv, os.path.join(self.work_dir, f"stream{sid}.log"), self.source.fps,
                                clock=self._clock, wall=self._wall)
+        stream.restart_on_end = bool(self.loop_input)
         self.streams.append(stream)
         self.output[sid] = SegmentMeter(plan.playlist)
         stream.start()
         self.peak_concurrent = max(self.peak_concurrent, len(self.active))
         tag = "HW" if plan.encode_hw else "SW"
-        self.log(f"stream {sid} started: {scenario.label} [{tag} {platform.id}] ({len(self.active)} running)")
+        subs_note = f", subtitles {plan.burn_in}" if plan.burn_in else ""
+        self.log(f"stream {sid} started: {scenario.label} [{tag} {platform.id}{subs_note}] ({len(self.active)} running)")
         return stream
 
     # --- run ----------------------------------------------------------------------------------
     def start(self) -> None:
         Path(self.work_dir).mkdir(parents=True, exist_ok=True)
+        self.write_loop_list()
+        self.prepare_burn_in()
         self.check()
         self.started_at, self._start_mono = self._wall(), self._clock()
         self.state = "running"
@@ -385,8 +426,26 @@ def remove_work_dir(path: str) -> Tuple[int, int]:
     p = Path(path)
     if not p.is_dir():
         return 0, 0
+    burn = p / subs.BURN_DIR   # subtitle files and fonts made for this run
+    if burn.is_dir():
+        for folder in [burn / "fonts", burn]:
+            if not folder.is_dir():
+                continue
+            for entry in folder.iterdir():
+                if entry.is_file():
+                    try:
+                        entry.unlink()
+                        removed += 1
+                    except OSError:
+                        left += 1
+            try:
+                folder.rmdir()
+            except OSError:
+                pass
     for entry in p.iterdir():
-        if entry.is_file() and entry.name.startswith("stream") and entry.suffix in (".ts", ".m3u8", ".log", ".tmp"):
+        ours = (entry.name.startswith("stream") and entry.suffix in (".ts", ".m3u8", ".log", ".tmp")) \
+            or entry.name == command.LOOP_FILE
+        if entry.is_file() and ours:
             try:
                 entry.unlink()
                 removed += 1

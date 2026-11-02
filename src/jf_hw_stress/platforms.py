@@ -39,6 +39,13 @@ class Platform:
     upload: str = ""                               # system frames → encoder frames ("" = encoder takes system frames)
     tonemap_filter: str = ""                       # on hardware frames
     tonemap_requires: str = ""                     # filter that must exist for tonemap_filter
+    # Subtitle burn-in on the GPU, as Jellyfin does it (EncodingHelper): subtitle frames are drawn in system
+    # memory, uploaded, and laid over the video with the backend's overlay filter.
+    overlay_filter: str = ""                       # "" = burn in on the CPU
+    overlay_init: Tuple[str, ...] = ()             # device setup the upload needs, when init_args has none
+    sub_format: str = "bgra"                       # pixel format of the subtitle frames before upload
+    sub_upload: str = "hwupload"
+    sub_max_height: int = 0                        # subtitle canvas limit; the overlay scales it to the output
     tested: bool = False
     device: str = ""                               # GPU name, filled in by detection
 
@@ -62,6 +69,11 @@ class Platform:
     def hw_tonemap(self, caps: Capabilities) -> bool:
         return bool(self.tonemap_filter) and caps.has_filter(self.tonemap_requires)
 
+    def hw_overlay(self, caps: Capabilities, text: bool) -> bool:
+        """Whether subtitles can be laid over the video on the GPU with this ffmpeg build."""
+        needed = [self.overlay_filter] + (["alphasrc", "subtitles"] if text else [])
+        return bool(self.overlay_filter) and all(caps.has_filter(f) for f in needed)
+
 
 VIDEOTOOLBOX = Platform(
     id="vt", name="Apple VideoToolbox", systems=("Darwin",),
@@ -72,6 +84,7 @@ VIDEOTOOLBOX = Platform(
     scale_filter="scale_vt",
     tonemap_filter="tonemap_videotoolbox=p=bt709:t=bt709:m=bt709:tonemap=bt2390",
     tonemap_requires="tonemap_videotoolbox",
+    overlay_filter="overlay_videotoolbox", overlay_init=("-init_hw_device", "videotoolbox=vt"),
     tested=True,
 )
 NVENC = Platform(
@@ -83,6 +96,8 @@ NVENC = Platform(
     scale_filter="scale_cuda", scale_format=":format=yuv420p",
     tonemap_filter="tonemap_cuda=format=yuv420p:p=bt709:t=bt709:m=bt709:tonemap=bt2390",
     tonemap_requires="tonemap_cuda",
+    overlay_filter="overlay_cuda", overlay_init=("-init_hw_device", "cuda=cu:0", "-filter_hw_device", "cu"),
+    sub_format="yuva420p", sub_upload="hwupload=derive_device=cuda",
 )
 QSV = Platform(
     id="qsv", name="Intel Quick Sync", systems=("Linux", "Windows"),
@@ -94,6 +109,7 @@ QSV = Platform(
     encoder_args={"*": ("-preset", "medium")},
     scale_filter="scale_qsv", scale_format=":format=nv12",
     upload="format=nv12,hwupload=extra_hw_frames=64",
+    overlay_filter="overlay_qsv", sub_upload="hwupload=derive_device=qsv:extra_hw_frames=64", sub_max_height=1080,
 )
 VAAPI = Platform(
     id="vaapi", name="VA-API (Intel / AMD)", systems=("Linux",),
@@ -105,6 +121,8 @@ VAAPI = Platform(
     upload="format=nv12,hwupload",
     tonemap_filter="tonemap_vaapi=format=nv12:p=bt709:t=bt709:m=bt709",
     tonemap_requires="tonemap_vaapi",
+    # Jellyfin's path for Intel (iHD). On AMD, Jellyfin overlays through Vulkan instead; not reproduced here.
+    overlay_filter="overlay_vaapi", sub_upload="hwupload=derive_device=vaapi", sub_max_height=1080,
 )
 AMF = Platform(
     id="amf", name="AMD AMF", systems=("Windows",),

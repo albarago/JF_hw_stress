@@ -41,6 +41,7 @@ class Capabilities:
     encoders: Set[str] = field(default_factory=set)
     decoders: Set[str] = field(default_factory=set)
     filters: Set[str] = field(default_factory=set)
+    jellyfin_build: bool = False   # jellyfin-ffmpeg, which has options stock ffmpeg lacks
 
     def has_filter(self, name: str) -> bool:
         return name in self.filters
@@ -136,4 +137,5 @@ def load(tools: Tools) -> Tools:
     if not tools.version:
         raise ToolError(f"{tools.ffmpeg} did not report a version; is it ffmpeg?")
     tools.caps = read_capabilities(tools.ffmpeg)
+    tools.caps.jellyfin_build = tools.is_jellyfin_build
     return tools

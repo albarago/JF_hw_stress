@@ -42,6 +42,8 @@ measured is `null`.
 | `dovi_profile` | Dolby Vision profile number, or `null` |
 | `is_hdr` | `true` for any HDR type |
 | `audio_codec`, `audio_profile`, `audio_channels`, `audio_sample_rate`, `audio_language` | First audio stream, `null` or empty when there is none |
+| `subtitles` | Subtitle tracks: `index` (ffmpeg stream index), `number` (from 0, as `--burn-in` takes it), `codec`, `language`, `title`, `default`, `forced`, `width` and `height` (picture subtitles), and `kind`: `text`, `image` or `unsupported`. Added in 2.2.0. |
+| `font_attachments` | Fonts embedded in the file (used by ASS subtitles). Added in 2.2.0. |
 
 ## `config`
 
@@ -59,6 +61,7 @@ measured is `null`.
 | `duration_limit_secs` | `--duration`, or `null` |
 | `max_streams` | Stream cap |
 | `seed` | Mixed-mode random seed, or `null` |
+| `burn_in` | `null`, or the burned-in subtitles: `kind` (`text` or `image`), `origin` (`track`, `file` or `sample`), `codec`, `label`, `track` and `stream_index` (a source track), `language`, `file` (an external file), `events` and `repeats` (text: lines in one pass, and copies laid end to end to follow the looped source), `embedded_fonts`, `canvas` (picture subtitles: the size they were made for). Added in 2.2.0. |
 
 ## `result`
 
@@ -93,6 +96,7 @@ measured is `null`.
 | `encode` | `hw` (bool) and `encoder` (for example `hevc_videotoolbox`) |
 | `decode` | `hw` (bool) |
 | `tonemap` | `hardware`, `software` or `null` |
+| `burn_in` | How this stream drew the subtitles, for example `GPU (overlay_videotoolbox)`, `CPU, libass` or `CPU, overlay`; `null` without burn-in. Added in 2.2.0. |
 | `status` | `stopped` (ended by the tool) or `error` (ffmpeg exited on its own) |
 | `started_at`, `ended_at` | Times |
 | `frames` | Frames encoded |
